@@ -163,12 +163,28 @@ class KimiDeltaAttention(nn.Module):
         output_attentions: bool | None = False,
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
-        if attention_mask is not None:
-            assert len(attention_mask.shape) == 2, (
-                "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
-                "for padding purposes (0 indicating padding). "
-                "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
-            )
+        # This layer only supports padding masks. Some HF generation paths may pass
+        # expanded causal masks (e.g. 3D/4D). In that case, we recover a 2D padding
+        # mask and ignore the causal part (causality is implicit in KDA).
+        if attention_mask is not None and attention_mask.ndim != 2:
+            mask = attention_mask
+            while mask.ndim > 2 and mask.shape[1] == 1:
+                mask = mask.squeeze(1)
+            if mask.ndim == 2:
+                attention_mask = mask
+            elif mask.ndim == 3:
+                if mask.dtype == torch.bool:
+                    keep = mask
+                else:
+                    # HF 4D causal masks are typically additive (0 keep, -inf mask).
+                    # Sometimes masks are 0/1 (1 keep, 0 mask). Handle both.
+                    keep = (mask == 0) if mask.min().item() < 0 else (mask > 0)
+                attention_mask = keep.any(dim=-2).to(torch.bool)
+            else:
+                raise ValueError(
+                    "Expected attention_mask to be 2D padding mask [batch, seq_len]. "
+                    f"Got shape={tuple(attention_mask.shape)}.",
+                )
 
         batch_size, q_len, _ = hidden_states.shape
         # change to inference mode.

@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from fla.ops.kda import chunk_kda, fused_recurrent_kda
 from fla.ops.kda.gate import fused_kda_gate, naive_kda_gate
 from fla.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
-from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
+from fla.utils import IS_INTEL_ALCHEMIST, IS_TMA_SUPPORTED, assert_close, device
 
 
 @pytest.mark.parametrize(
@@ -181,6 +181,8 @@ def test_chunk(
     tma: bool,
 ):
     torch.manual_seed(42)
+    if tma and not IS_TMA_SUPPORTED:
+        pytest.skip("TMA requested by test but not supported on this GPU.")
     if not tma:
         os.environ["FLA_USE_TMA"] = "0"
     else:

@@ -1,45 +1,71 @@
-# test file
+### Local scratch / notebooks
 test.py
+*.ipynb
+.ipynb_checkpoints/
 
-# data files
-data
+### Data / experiments (local)
+data/
+exp/
+results/
+wandb/
+runs/
+tensorboard/
 
-# bash scripts
-*.sh
+### Hugging Face / Accelerate
+**/checkpoint-*/
+**/runs/
+**/.cache/
 
-# docs
-docs/_build
+### Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+htmlcov/
 
-# intermediate files
-build
-dist
-*.egg-info
-dist-packages/*
+### Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+dist-packages/
 
-# experimental results
-exp
-results
-wandb
-*.csv
-*.png
-*.html
-
-# log and config files
-log.*
+### Logs
 *.log
-*.cfg
-*.ini
+log.*/
 
-# pycache
-__pycache__
+### Binaries / compiled artifacts
+*.so
+*.dylib
+*.dll
+*.exe
+*.o
+*.a
 
-# saved model
-*.pkl
+### Model weights / checkpoints
 *.pt
+*.pth
+*.bin
+*.pkl
+*.safetensors
 
+### Virtualenvs
+.venv/
+venv/
+ENV/
 
-# vscode
-.vscode
+### Editors
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# macOS
+### Docs build
+docs/_build/
+
+### OS
 .DS_Store

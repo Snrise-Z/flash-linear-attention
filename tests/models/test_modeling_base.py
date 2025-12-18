@@ -5,6 +5,7 @@ import torch
 from transformers.configuration_utils import PretrainedConfig
 
 from fla.utils import IS_INTEL_ALCHEMIST, IS_NVIDIA_HOPPER, assert_close, device
+from fla.utils import device_platform
 
 from .test_modeling_utils import (
     GENERATION_UNSUPPORTED,
@@ -13,6 +14,28 @@ from .test_modeling_utils import (
     NOT_READY_FOR_TESTING,
     create_model_and_config,
 )
+
+def _bf16_supported_for_tests() -> bool:
+    """
+    bfloat16 is not supported on some accelerators (e.g. NVIDIA Turing / RTX 2080 Ti).
+    We treat bf16 support as a runtime capability and skip bf16-parametrized tests when unavailable.
+    """
+    if device == "cpu":
+        return False
+
+    if device_platform == "cuda" and hasattr(torch.cuda, "is_bf16_supported"):
+        try:
+            return bool(torch.cuda.is_bf16_supported())
+        except Exception:
+            pass
+
+    try:
+        a = torch.randn(2, 2, device=device, dtype=torch.bfloat16)
+        b = torch.randn(2, 2, device=device, dtype=torch.bfloat16)
+        (a @ b).sum().item()
+        return True
+    except Exception:
+        return False
 
 
 # ===================================================================================
@@ -35,6 +58,8 @@ def run_test_model_forward_backward(
     """
     A foundational test for the forward and backward passes of a model.
     """
+    if dtype is torch.bfloat16 and not _bf16_supported_for_tests():
+        pytest.skip("bfloat16 is not supported on this device.")
     if not IS_NVIDIA_HOPPER and D == 128:
         pytest.skip("D=128 is only tested on Hopper GPUs to save CI time.")
     if not IS_NVIDIA_HOPPER and config_class.__name__ in HOPPER_EXCLUSIVE:
@@ -79,6 +104,8 @@ def run_test_generation(
     A foundational test for K/V cache-based generation.
     """
     torch.manual_seed(42)
+    if dtype is torch.bfloat16 and not _bf16_supported_for_tests():
+        pytest.skip("bfloat16 is not supported on this device.")
     if config_class.__name__ in GENERATION_UNSUPPORTED:
         pytest.skip(f"Generation test not supported for {config_class.__name__}.")
     if config_class.__name__ in NOT_READY_FOR_TESTING:
