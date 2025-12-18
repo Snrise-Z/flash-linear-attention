@@ -3,8 +3,8 @@ from __future__ import annotations
 from transformers.configuration_utils import PretrainedConfig
 
 
-class FSKDAConfig(PretrainedConfig):
-    model_type = "fskda"
+class FSNKDAConfig(PretrainedConfig):
+    model_type = "fsnkda"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -36,7 +36,7 @@ class FSKDAConfig(PretrainedConfig):
         fuse_cross_entropy: bool = True,
         use_l2warp: bool = False,
         vocab_size: int = 32000,
-        # FSKDA-specific knobs (fast/slow + fusion + features)
+        # FSNKDA-specific knobs
         stat_eps: float = 1e-6,
         mlp_hidden_dim: int = 32,
         head_embed_dim: int = 4,
@@ -44,9 +44,7 @@ class FSKDAConfig(PretrainedConfig):
         uncertainty_bins: int = 64,
         include_margin: bool = False,
         gate_logit_normalizer: float = 1.0,
-        use_beta_norm: bool = False,
         beta_norm_eps: float = 1e-6,
-        use_qk_l2norm_in_kernel: bool = False,
         fix_lambda: float | None = None,
         share_decay_gate: bool = False,
         **kwargs,
@@ -85,9 +83,7 @@ class FSKDAConfig(PretrainedConfig):
         self.include_margin = include_margin
         self.gate_logit_normalizer = gate_logit_normalizer
 
-        self.use_beta_norm = use_beta_norm
         self.beta_norm_eps = beta_norm_eps
-        self.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         self.fix_lambda = fix_lambda
         self.share_decay_gate = share_decay_gate
 
@@ -110,3 +106,4 @@ class FSKDAConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+

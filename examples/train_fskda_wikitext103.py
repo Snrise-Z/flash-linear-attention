@@ -19,9 +19,11 @@ from _wikitext103_common import (
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train a small FSKDA model on WikiText-103 (HF Trainer).")
+    p = argparse.ArgumentParser(
+        description="Train a small Fast/Slow Surprise-aware KDA (FSKDA) model on WikiText-103 (HF Trainer)."
+    )
 
-    p.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer name or local path.")
+    p.add_argument("--tokenizer", type=str, default="gpt2")
     p.add_argument("--dataset_name", type=str, default="wikitext")
     p.add_argument("--dataset_config", type=str, default="wikitext-103-raw-v1")
     p.add_argument("--text_column", type=str, default="text")
@@ -45,12 +47,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_short_conv", action="store_true", default=False)
     p.add_argument("--allow_neg_eigval", action="store_true", default=False)
 
-    # FSKDA-specific knobs
-    p.add_argument("--use_beta_norm", action="store_true", default=None)
+    # FSKDA ablations
     p.add_argument("--use_qk_l2norm_in_kernel", action="store_true", default=None)
-    p.add_argument("--beta_norm_eps", type=float, default=None)
-    p.add_argument("--fix_lambda", type=float, default=None, help="If set, fixes λ to this value in [0,1].")
-    p.add_argument("--share_decay_gate", action="store_true", default=None, help="If set, share fast/slow decay gate.")
+    p.add_argument("--fix_lambda", type=float, default=None)
+    p.add_argument("--share_decay_gate", action="store_true", default=None)
 
     p.add_argument("--no_fuse_norm", action="store_true", default=False)
     p.add_argument("--no_fuse_swiglu", action="store_true", default=False)
@@ -87,13 +87,9 @@ def main() -> None:
 
     fp16, bf16 = detect_mixed_precision_train(args)
 
-    config_kwargs: dict[str, object] = {}
-    if args.use_beta_norm is not None:
-        config_kwargs["use_beta_norm"] = args.use_beta_norm
+    config_kwargs: dict[str, object] = {"use_beta_norm": False}
     if args.use_qk_l2norm_in_kernel is not None:
         config_kwargs["use_qk_l2norm_in_kernel"] = args.use_qk_l2norm_in_kernel
-    if args.beta_norm_eps is not None:
-        config_kwargs["beta_norm_eps"] = args.beta_norm_eps
     if args.fix_lambda is not None:
         config_kwargs["fix_lambda"] = args.fix_lambda
     if args.share_decay_gate is not None:

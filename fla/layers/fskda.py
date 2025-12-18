@@ -57,7 +57,7 @@ class FastSlowSurpriseKimiDeltaAttention(nn.Module):
         include_margin: bool = False,
         gate_logit_normalizer: float = 1.0,
         # beta normalization (NKDA-style)
-        use_beta_norm: bool = True,
+        use_beta_norm: bool = False,
         beta_norm_eps: float = 1e-6,
         use_qk_l2norm_in_kernel: bool = False,
         # ablations

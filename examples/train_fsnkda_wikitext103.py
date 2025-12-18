@@ -7,7 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import fla  # noqa: F401
-from fla.models import FSKDAConfig
+from fla.models import FSNKDAConfig
 
 from _wikitext103_common import (
     build_training_args,
@@ -20,9 +20,7 @@ from _wikitext103_common import (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description=(
-            "Train a small Fast/Slow Surprise-aware Normalized KDA (FSSNKDA) model on WikiText-103 (HF Trainer)."
-        )
+        description="Train a small Fast/Slow Surprise-aware Normalized KDA (FSNKDA) model on WikiText-103 (HF Trainer)."
     )
 
     p.add_argument("--tokenizer", type=str, default="gpt2")
@@ -37,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_train_samples", type=int, default=None)
     p.add_argument("--max_eval_samples", type=int, default=None)
 
-    p.add_argument("--output_dir", type=str, default="exp/fssnkda-wikitext103")
+    p.add_argument("--output_dir", type=str, default="exp/fsnkda-wikitext103")
     p.add_argument("--resume_from_checkpoint", type=str, default=None)
 
     p.add_argument("--hidden_size", type=int, default=512)
@@ -49,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_short_conv", action="store_true", default=False)
     p.add_argument("--allow_neg_eigval", action="store_true", default=False)
 
-    # FSSNKDA knobs
+    # FSNKDA ablations
     p.add_argument("--beta_norm_eps", type=float, default=None)
     p.add_argument("--fix_lambda", type=float, default=None)
     p.add_argument("--share_decay_gate", action="store_true", default=None)
@@ -89,7 +87,7 @@ def main() -> None:
 
     fp16, bf16 = detect_mixed_precision_train(args)
 
-    config_kwargs: dict[str, object] = {"use_beta_norm": True, "use_qk_l2norm_in_kernel": False}
+    config_kwargs: dict[str, object] = {}
     if args.beta_norm_eps is not None:
         config_kwargs["beta_norm_eps"] = args.beta_norm_eps
     if args.fix_lambda is not None:
@@ -97,7 +95,7 @@ def main() -> None:
     if args.share_decay_gate is not None:
         config_kwargs["share_decay_gate"] = args.share_decay_gate
 
-    config = FSKDAConfig(
+    config = FSNKDAConfig(
         attn_mode=args.attn_mode,
         hidden_size=args.hidden_size,
         expand_v=args.expand_v,

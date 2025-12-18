@@ -19,7 +19,7 @@ from _wikitext103_common import (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Evaluate a Fast/Slow Surprise-aware KDA (FSSKDA) model on WikiText-103 (loss/perplexity)."
+        description="Evaluate a Fast/Slow Surprise-aware Normalized KDA (FSNKDA) model on WikiText-103 (loss/perplexity)."
     )
 
     p.add_argument("--model", type=str, required=True)
@@ -40,7 +40,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp16", "bf16", "fp32"])
 
-    p.add_argument("--use_qk_l2norm_in_kernel", action="store_true", default=False)
     p.add_argument("--fix_lambda", type=float, default=None)
     p.add_argument("--share_decay_gate", action="store_true", default=False)
 
@@ -64,13 +63,6 @@ def main() -> None:
     dtype = detect_dtype_eval(args.dtype)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(args.device)
 
-    changed = override_attr_on_modules(model, "use_beta_norm", False)
-    if changed:
-        print(f"[variant] set use_beta_norm=False on {changed} modules")
-
-    if args.use_qk_l2norm_in_kernel:
-        changed = override_attr_on_modules(model, "use_qk_l2norm_in_kernel", True)
-        print(f"[ablation] set use_qk_l2norm_in_kernel=True on {changed} modules")
     if args.fix_lambda is not None:
         changed = override_attr_on_modules(model, "fix_lambda", float(args.fix_lambda))
         print(f"[ablation] set fix_lambda={args.fix_lambda} on {changed} modules")

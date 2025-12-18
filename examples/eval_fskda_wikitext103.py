@@ -18,7 +18,9 @@ from _wikitext103_common import (
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate a FSKDA model on WikiText-103 (loss/perplexity).")
+    p = argparse.ArgumentParser(
+        description="Evaluate a Fast/Slow Surprise-aware KDA (FSKDA) model on WikiText-103 (loss/perplexity)."
+    )
 
     p.add_argument("--model", type=str, required=True)
     p.add_argument("--tokenizer", type=str, default=None)
@@ -39,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp16", "bf16", "fp32"])
 
     p.add_argument("--use_qk_l2norm_in_kernel", action="store_true", default=False)
-    p.add_argument("--fix_lambda", type=float, default=None, help="If set, fixes λ to this value in [0,1].")
+    p.add_argument("--fix_lambda", type=float, default=None)
     p.add_argument("--share_decay_gate", action="store_true", default=False)
 
     p.add_argument("--generate", action="store_true")
@@ -61,6 +63,10 @@ def main() -> None:
 
     dtype = detect_dtype_eval(args.dtype)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(args.device)
+
+    changed = override_attr_on_modules(model, "use_beta_norm", False)
+    if changed:
+        print(f"[variant] set use_beta_norm=False on {changed} modules")
 
     if args.use_qk_l2norm_in_kernel:
         changed = override_attr_on_modules(model, "use_qk_l2norm_in_kernel", True)
