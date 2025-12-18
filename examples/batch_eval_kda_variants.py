@@ -16,6 +16,8 @@ from queue import Queue
 
 
 LOSS_RE = re.compile(r"loss=(?P<loss>[0-9.]+)\\s+ppl=(?P<ppl>[0-9.]+)")
+PROMPT_MARK = "--- prompt ---"
+GEN_MARK = "--- generation ---"
 
 
 def _parse_csv(s: str) -> list[str]:
@@ -47,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--generate", action="store_true", default=False)
     p.add_argument("--prompt", type=str, default="The meaning of life is")
     p.add_argument("--max_new_tokens", type=int, default=64)
+    p.add_argument(
+        "--generations_dir",
+        type=str,
+        default=None,
+        help="If --generate is set, write generations to this directory (default: <run_root>/generations).",
+    )
 
     p.add_argument("--tokenized_cache", type=str, default=None, help="Override tokenized cache used for eval.")
     p.add_argument("--extra_args", type=str, default="", help="Extra args appended verbatim to every eval command.")
@@ -109,6 +117,32 @@ def _parse_metrics(log_text: str) -> tuple[float | None, float | None]:
     return float(m.group("loss")), float(m.group("ppl"))
 
 
+def _parse_generation(log_text: str) -> tuple[str | None, str | None]:
+    """
+    Extract (prompt, generation) from eval script output, if present.
+    Expected markers:
+      --- prompt ---
+      <prompt>
+      --- generation ---
+      <generation>
+    """
+    if GEN_MARK not in log_text:
+        return None, None
+
+    # Prefer extracting prompt if present, but tolerate missing prompt marker.
+    prompt = None
+    generation = None
+
+    if PROMPT_MARK in log_text:
+        after_prompt = log_text.split(PROMPT_MARK, 1)[1]
+        if GEN_MARK in after_prompt:
+            prompt = after_prompt.split(GEN_MARK, 1)[0].strip()
+
+    after_gen = log_text.split(GEN_MARK, 1)[1]
+    generation = after_gen.strip()
+    return prompt, generation
+
+
 def main() -> None:
     args = parse_args()
     manifest_path = Path(args.manifest).resolve()
@@ -129,6 +163,9 @@ def main() -> None:
     run_root = manifest_path.parent
     logs_dir = run_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+    generations_dir = Path(args.generations_dir).resolve() if args.generations_dir else (run_root / "generations")
+    if args.generate:
+        generations_dir.mkdir(parents=True, exist_ok=True)
     results_path = run_root / f"eval_{args.split}_{_timestamp()}.csv"
 
     # Read manifest and build jobs.
@@ -171,6 +208,22 @@ def main() -> None:
             return int(proc.returncode)
         txt = job.log_path.read_text(encoding="utf-8", errors="ignore")
         loss, ppl = _parse_metrics(txt)
+        gen_path = None
+        if args.generate:
+            prompt, generation = _parse_generation(txt)
+            gen_path = generations_dir / f"{job.variant}.txt"
+            with open(gen_path, "w", encoding="utf-8") as gf:
+                gf.write(f"variant: {job.variant}\n")
+                gf.write(f"model_dir: {job.model_dir}\n")
+                gf.write(f"prompt_arg: {args.prompt}\n")
+                if prompt is not None:
+                    gf.write("\n--- prompt ---\n")
+                    gf.write(prompt.rstrip() + "\n")
+                if generation is not None:
+                    gf.write("\n--- generation ---\n")
+                    gf.write(generation.rstrip() + "\n")
+                else:
+                    gf.write("\n[note] generation markers not found in log\n")
         with lock:
             results[job.variant] = {
                 "variant": job.variant,
@@ -178,6 +231,7 @@ def main() -> None:
                 "loss": loss,
                 "ppl": ppl,
                 "log": str(job.log_path),
+                "generation": str(gen_path) if gen_path is not None else "",
             }
         return 0
 
@@ -213,7 +267,7 @@ def main() -> None:
 
     # Write results CSV.
     with open(results_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["variant", "model_dir", "loss", "ppl", "log"])
+        w = csv.DictWriter(f, fieldnames=["variant", "model_dir", "loss", "ppl", "log", "generation"])
         w.writeheader()
         for v in sorted(results):
             w.writerow(results[v])
@@ -226,4 +280,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
