@@ -17,6 +17,7 @@ from fla.models.hgrn import HGRNConfig, HGRNForCausalLM, HGRNModel
 from fla.models.hgrn2 import HGRN2Config, HGRN2ForCausalLM, HGRN2Model
 from fla.models.kda import KDAConfig, KDAForCausalLM, KDAModel
 from fla.models.fkda import FKDAConfig, FKDAForCausalLM, FKDAModel
+from fla.models.fnkda import FNKDAConfig, FNKDAForCausalLM, FNKDAModel
 from fla.models.fskda import FSKDAConfig, FSKDAForCausalLM, FSKDAModel
 from fla.models.nkda import NKDAConfig, NKDAForCausalLM, NKDAModel
 from fla.models.snkda import SNKDAConfig, SNKDAForCausalLM, SNKDAModel
@@ -81,6 +82,9 @@ __all__ = [
     'FKDAConfig',
     'FKDAForCausalLM',
     'FKDAModel',
+    'FNKDAConfig',
+    'FNKDAForCausalLM',
+    'FNKDAModel',
     'FSKDAConfig',
     'FSKDAForCausalLM',
     'FSKDAModel',

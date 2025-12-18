@@ -17,6 +17,7 @@ from .hgrn2 import HGRN2Attention
 from .kda import KimiDeltaAttention
 from .fkda import FastSlowKimiDeltaAttention
 from .fskda import FastSlowSurpriseKimiDeltaAttention
+from .fnkda import FastSlowNormalizedKimiDeltaAttention
 from .nkda import NormalizedKimiDeltaAttention
 from .snkda import SurpriseNormalizedKimiDeltaAttention
 from .skda import SurpriseKimiDeltaAttention
@@ -53,6 +54,7 @@ __all__ = [
     'KimiDeltaAttention',
     'FastSlowKimiDeltaAttention',
     'FastSlowSurpriseKimiDeltaAttention',
+    'FastSlowNormalizedKimiDeltaAttention',
     'NormalizedKimiDeltaAttention',
     'SurpriseNormalizedKimiDeltaAttention',
     'SurpriseKimiDeltaAttention',
