@@ -50,6 +50,8 @@ class SurpriseKimiDeltaAttention(nn.Module):
         layer_idx: int = None,
         norm_eps: float = 1e-5,
         surprise_gate_logit_normalizer: float = 1.0,
+        surprise_stat_eps: float = 1e-6,
+        surprise_mlp_hidden_dim: int = 32,
         use_qk_l2norm_in_kernel: bool = True,
         **kwargs,
     ) -> SurpriseKimiDeltaAttention:
@@ -61,6 +63,8 @@ class SurpriseKimiDeltaAttention(nn.Module):
         self.expand_v = expand_v
         self.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         self.surprise_gate_logit_normalizer = surprise_gate_logit_normalizer
+        self.surprise_stat_eps = surprise_stat_eps
+        self.surprise_mlp_hidden_dim = surprise_mlp_hidden_dim
 
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
@@ -95,6 +99,10 @@ class SurpriseKimiDeltaAttention(nn.Module):
             raise ValueError(f"Not supported mode `{mode}`.")
         if surprise_gate_logit_normalizer <= 0:
             raise ValueError("surprise_gate_logit_normalizer must be > 0")
+        if surprise_stat_eps <= 0:
+            raise ValueError("surprise_stat_eps must be > 0")
+        if surprise_mlp_hidden_dim <= 0:
+            raise ValueError("surprise_mlp_hidden_dim must be > 0")
 
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
@@ -127,10 +135,19 @@ class SurpriseKimiDeltaAttention(nn.Module):
         self.dt_bias._no_weight_decay = True
 
         # Surprise proxy: v_hat = P(k); e = v_hat - v.
-        # Implemented head-wise: k:[...,HV,K] -> v_hat:[...,HV,V]
+        # We compute a small set of statistics from e to reduce noise:
+        #   s = [||e||_2, ||e||_1, 1 - cos(v_hat, v)]
         self.surprise_v_proj = nn.Linear(self.head_k_dim, self.head_v_dim, bias=False)
-        self.surprise_alpha_proj = nn.Linear(self.head_v_dim, self.head_k_dim, bias=True)
-        self.surprise_beta_proj = nn.Linear(self.head_v_dim, 1, bias=True)
+        self.surprise_beta_mlp = nn.Sequential(
+            nn.Linear(3, surprise_mlp_hidden_dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(surprise_mlp_hidden_dim, 1, bias=True),
+        )
+        self.surprise_alpha_mlp = nn.Sequential(
+            nn.Linear(3, surprise_mlp_hidden_dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(surprise_mlp_hidden_dim, 1, bias=True),
+        )
 
         self.g_proj = nn.Sequential(
             nn.Linear(hidden_size, self.head_v_dim, bias=False),
@@ -214,12 +231,30 @@ class SurpriseKimiDeltaAttention(nn.Module):
         if self.num_v_heads > self.num_heads:
             q, k = (repeat(x, "... h d -> ... (h g) d", g=self.num_v_heads // self.num_heads) for x in (q, k))
 
-        # surprise proxy error
+        # Surprise proxy error: v_hat = P(k); e = v_hat - v.
         v_hat = self.surprise_v_proj(k)
         e = v_hat - v
 
-        beta = torch.sigmoid(self.surprise_beta_proj(e).squeeze(-1))
-        g_raw = self.surprise_alpha_proj(e) / self.surprise_gate_logit_normalizer
+        # Compress e into stable statistics s = [L2, L1, cosine distance]
+        # Shapes: v_hat/v/e are [..., HV, V]
+        eps = self.surprise_stat_eps
+        v_hat_f = v_hat.to(torch.float32)
+        v_f = v.to(torch.float32)
+        e_f = e.to(torch.float32)
+        s_l2 = e_f.square().sum(dim=-1).add(eps).sqrt()
+        s_l1 = e_f.abs().sum(dim=-1)
+        cos_den = v_hat_f.square().sum(dim=-1).add(eps).sqrt() * v_f.square().sum(dim=-1).add(eps).sqrt() + eps
+        cos_sim = (v_hat_f * v_f).sum(dim=-1) / cos_den
+        s_cos = 1.0 - cos_sim
+        s = torch.stack((s_l2, s_l1, s_cos), dim=-1)
+
+        beta = torch.sigmoid(self.surprise_beta_mlp(s).squeeze(-1)).to(v.dtype)
+
+        # g_raw must have shape [..., HV, K]. Use a scalar amplitude from MLP and
+        # a simple per-dim reference r_t derived from k (normalized).
+        r = F.normalize(k.to(torch.float32), p=2, dim=-1).to(k.dtype)
+        amp = (self.surprise_alpha_mlp(s).squeeze(-1) / self.surprise_gate_logit_normalizer).to(k.dtype)
+        g_raw = r * amp.unsqueeze(-1)
 
         if self.allow_neg_eigval:
             beta = beta * 2.0
@@ -271,4 +306,3 @@ class SurpriseKimiDeltaAttention(nn.Module):
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_values
-

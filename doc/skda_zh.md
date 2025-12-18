@@ -51,6 +51,30 @@
 
 ---
 
+## 3.1 进一步稳定：把误差代理压缩成“统计量”
+
+直接把 `e ∈ R^{d_v}` 的整向量喂给 gate，实践中容易被某些维度的噪声/偶然模式影响。SKDA 增强版本将误差代理先压缩为几个标量统计量，再喂给非常小的 MLP：
+
+- `s^(L2) = ||e||_2`
+- `s^(L1) = ||e||_1`
+- `s^(cos) = 1 - cos(v_hat, v)`
+
+拼成 `s = [s^(L2), s^(L1), s^(cos)]`，用于产生门控：
+
+- `beta = sigmoid(MLP_beta(s))`
+- `amp = MLP_alpha(s) / surprise_gate_logit_normalizer`
+
+其中 `amp` 是标量幅度。为了让 `g_raw` 仍具备 `d_k` 维度，我们再从 `k` 构造一个不依赖 `S_{t-1}` 的参考向量：
+
+- `r = normalize(k)`（逐 token/head 的 `d_k` 向量）
+- `g_raw = amp * r`（对 `d_k` 维广播）
+
+这样做的好处：
+- gate 决策只依赖误差的“大小/方向偏差”这类 summary statistic，更稳、更不易过拟合某些 value 维度；
+- 所有输入都只依赖当前 token 的 `(k, v)`，不包含 `S_{t-1}`，因此不破坏 chunk 并行。
+
+---
+
 ## 4. 代码变更总览（SKDA 相关）
 
 ### 4.1 新增：SKDA layer
@@ -62,9 +86,15 @@
 - 结构上参考 `KimiDeltaAttention`，保留 short conv、输出门、以及 `A_log/dt_bias` 的 decay 参数化。
 - 新增“surprise proxy”子网络（逐 head）：
   - `surprise_v_proj: Linear(d_k -> d_v)`：得到 `v_hat`
-  - `surprise_beta_proj: Linear(d_v -> 1)`：从误差产生 `β`
-  - `surprise_alpha_proj: Linear(d_v -> d_k)`：从误差产生 `g_raw`（作为 gate 的 raw 输入）
-- `g_raw` 会做一个缩放：`g_raw /= surprise_gate_logit_normalizer`，用来控制数值范围/稳定性。
+  - 从 `e=v_hat-v` 提取统计量 `s=[L2,L1,cos]`
+  - `surprise_beta_mlp: MLP(3 -> hidden -> 1)`：从统计量产生 `β`
+  - `surprise_alpha_mlp: MLP(3 -> hidden -> 1)`：从统计量产生标量幅度 `amp`
+  - `r = normalize(k)`，`g_raw = amp * r`
+
+新增/更新的配置项：
+- `surprise_gate_logit_normalizer`：控制 `amp` 缩放
+- `surprise_stat_eps`：统计量计算的数值稳定项（L2/cos 分母）
+- `surprise_mlp_hidden_dim`：上述 MLP 的隐藏维度
 
 ### 4.2 新增：SKDA HF 模型（Transformers 兼容）
 
@@ -76,6 +106,8 @@
   - `model_type = "skda"`
   - 新增 SKDA 专属配置项：
     - `surprise_gate_logit_normalizer: float = 1.0`
+    - `surprise_stat_eps: float = 1e-6`
+    - `surprise_mlp_hidden_dim: int = 32`
     - `use_qk_l2norm_in_kernel: bool = True`
 - `fla/models/skda/modeling_skda.py`
   - 新模型：`SKDAModel` / `SKDAForCausalLM`
@@ -138,4 +170,3 @@ model = AutoModelForCausalLM.from_config(cfg)
 修改：
 - `fla/layers/__init__.py`：导出 `SurpriseKimiDeltaAttention`
 - `fla/models/__init__.py`：导出 SKDA
-

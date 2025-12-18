@@ -38,6 +38,8 @@ class SKDAConfig(PretrainedConfig):
         vocab_size: int = 32000,
         # SKDA-specific
         surprise_gate_logit_normalizer: float = 1.0,
+        surprise_stat_eps: float = 1e-6,
+        surprise_mlp_hidden_dim: int = 32,
         use_qk_l2norm_in_kernel: bool = True,
         **kwargs,
     ):
@@ -68,6 +70,8 @@ class SKDAConfig(PretrainedConfig):
         self.allow_neg_eigval = allow_neg_eigval
 
         self.surprise_gate_logit_normalizer = surprise_gate_logit_normalizer
+        self.surprise_stat_eps = surprise_stat_eps
+        self.surprise_mlp_hidden_dim = surprise_mlp_hidden_dim
         self.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
 
         if attn is not None:
@@ -89,4 +93,3 @@ class SKDAConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-

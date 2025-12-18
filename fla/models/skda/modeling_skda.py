@@ -63,6 +63,8 @@ class SKDABlock(nn.Module):
                 conv_size=config.conv_size,
                 norm_eps=config.norm_eps,
                 surprise_gate_logit_normalizer=config.surprise_gate_logit_normalizer,
+                surprise_stat_eps=config.surprise_stat_eps,
+                surprise_mlp_hidden_dim=config.surprise_mlp_hidden_dim,
                 use_qk_l2norm_in_kernel=config.use_qk_l2norm_in_kernel,
                 layer_idx=layer_idx,
             )
@@ -355,4 +357,3 @@ class SKDAForCausalLM(SKDAPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
