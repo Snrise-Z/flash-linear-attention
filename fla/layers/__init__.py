@@ -16,6 +16,7 @@ from .hgrn import HGRNAttention
 from .hgrn2 import HGRN2Attention
 from .kda import KimiDeltaAttention
 from .nkda import NormalizedKimiDeltaAttention
+from .snkda import SurpriseNormalizedKimiDeltaAttention
 from .skda import SurpriseKimiDeltaAttention
 from .lightnet import LightNetAttention
 from .linear_attn import LinearAttention
@@ -49,6 +50,7 @@ __all__ = [
     'HGRN2Attention',
     'KimiDeltaAttention',
     'NormalizedKimiDeltaAttention',
+    'SurpriseNormalizedKimiDeltaAttention',
     'SurpriseKimiDeltaAttention',
     'LightNetAttention',
     'LinearAttention',
