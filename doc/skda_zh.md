@@ -38,10 +38,10 @@
    - `v_hat = P(k)`
 2. 误差代理：
    - `e = v_hat - v`
-3. 用 `e` 生成门控：
-   - `β = sigmoid(w_beta(e))`（标量/每 head）
-   - `g_raw = W_alpha(e)`（每 head 的 `d_k` 维向量，作为 KDA 的 decay raw input）
-4. 仍然调用原 KDA 内核（并行不变）：
+3. 先将误差代理压缩为少量统计特征（见 3.1/3.2），再由小 MLP 生成门控：
+   - `β = sigmoid(MLP_beta(features))`（标量/每 head）
+   - `g_raw = amp(features) * normalize(k)`（每 head 的 `d_k` 维向量，作为 KDA 的 decay raw input）
+4. 调用原 KDA 内核（并行不变）：
    - 训练：`chunk_kda(..., g=g_raw, beta=β, use_gate_in_kernel=True, ...)`
    - 推理短序列：`fused_recurrent_kda(..., g=fused_kda_gate(g_raw), beta=β, ...)`
 
@@ -95,7 +95,8 @@
 - `g_raw = amp * normalize(k)`，其中 `amp = (w_amp^T h + b)/normalizer`
 
 说明：
-- “不确定性”不是用最终 LM head 的 vocab logits（attention 层拿不到），而是用一个很轻量的 **辅助 logits 投影** `Linear(hidden_size -> C)` 来近似不确定性，然后计算其熵（可选 margin）。这满足“只依赖当前 token”的并行约束，且工程上更容易落地。
+- “不确定性”不是用最终 LM head 的 vocab logits（attention 层拿不到），而是用一个很轻量的 **辅助 logits 投影** `Linear(hidden_size -> C)` 来近似不确定性，然后计算其熵（可选 margin）。该辅助投影仅依赖当前层 hidden state：不访问记忆 `S`，不与最终 `lm_head` 共享参数，仅作为局部 uncertainty proxy；因此满足“只依赖当前 token”的并行约束，且工程上更容易落地。
+- head embedding 默认不训练（冻结），仅作为静态 head 区分信号；如需探索可学习 head 角色，可通过 `surprise_trainable_head_embed=True` 开启训练。
 
 ---
 
