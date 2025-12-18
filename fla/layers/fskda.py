@@ -333,6 +333,9 @@ class FastSlowSurpriseKimiDeltaAttention(nn.Module):
             feats.insert(2, margin_h.unsqueeze(-1))
         x_feat = torch.cat(feats + [head_emb], dim=-1)
 
+        # Feature engineering is done in float32 for stability, but model weights may be fp16/bf16.
+        # Ensure MLP input dtype matches MLP weights dtype to avoid matmul dtype mismatch.
+        x_feat = x_feat.to(next(self.feat_mlp.parameters()).dtype)
         h = self.feat_mlp(x_feat)
 
         beta_base = self.beta_base_head(h).squeeze(-1).to(torch.float32)
