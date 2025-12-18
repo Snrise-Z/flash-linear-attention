@@ -281,6 +281,25 @@ def _has_final_model(out_dir: Path) -> bool:
     return False
 
 
+def _read_trainer_global_step(out_dir: Path) -> int | None:
+    """
+    Best-effort read of HF Trainer state to decide whether a run already reached max_steps.
+    """
+    p = out_dir / "trainer_state.json"
+    if not p.is_file():
+        return None
+    try:
+        state = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    step = state.get("global_step")
+    if isinstance(step, int):
+        return step
+    if isinstance(step, float):
+        return int(step)
+    return None
+
+
 def _build_train_cmd(
     args: argparse.Namespace,
     variant: str,
@@ -394,11 +413,37 @@ def main() -> None:
         out_dir = j.out_dir
         latest_ckpt = _find_latest_checkpoint(out_dir)
         has_final = _has_final_model(out_dir)
+        global_step = _read_trainer_global_step(out_dir)
+        latest_step = None
+        if latest_ckpt is not None:
+            m = re.fullmatch(r"checkpoint-(\d+)", latest_ckpt.name)
+            if m:
+                latest_step = int(m.group(1))
+
+        is_done = False
+        if global_step is not None and global_step >= int(args.max_steps):
+            is_done = True
+        elif latest_step is not None and latest_step >= int(args.max_steps):
+            is_done = True
+        elif has_final and global_step is not None and global_step > 0 and global_step >= int(args.max_steps):
+            is_done = True
 
         resume_from: Path | None = None
         if args.resume_mode == "off":
             resume_from = None
         elif args.resume_mode == "auto":
+            if is_done:
+                skipped.append(
+                    {
+                        "variant": j.variant,
+                        "output_dir": str(out_dir),
+                        "status": "skipped_done",
+                        "global_step": global_step,
+                        "latest_checkpoint": str(latest_ckpt) if latest_ckpt is not None else None,
+                    }
+                )
+                print(f"[skip:{j.variant}] already done (global_step={global_step}, out={out_dir})", flush=True)
+                continue
             if latest_ckpt is not None:
                 resume_from = latest_ckpt
             elif has_final:
@@ -407,8 +452,10 @@ def main() -> None:
                         "variant": j.variant,
                         "output_dir": str(out_dir),
                         "status": "skipped_done",
+                        "global_step": global_step,
                     }
                 )
+                print(f"[skip:{j.variant}] final model exists (out={out_dir})", flush=True)
                 continue
         elif args.resume_mode == "force":
             if latest_ckpt is None:
