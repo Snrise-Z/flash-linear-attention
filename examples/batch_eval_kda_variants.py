@@ -38,7 +38,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manifest", type=str, required=True, help="Path to runs.jsonl produced by batch_train script.")
     p.add_argument("--gpus", type=str, default="0", help="Comma-separated GPU ids, e.g. '0,1'.")
     p.add_argument("--jobs_per_gpu", type=int, default=1)
-    p.add_argument("--keep_going", action="store_true")
+    p.add_argument(
+        "--keep_going",
+        action="store_true",
+        default=True,
+        help="Deprecated (always on): continue running other jobs even if some jobs fail.",
+    )
 
     p.add_argument("--split", type=str, default="validation", choices=["train", "validation", "test"])
     p.add_argument("--seq_len", type=int, default=1024)
@@ -247,14 +252,7 @@ def main() -> None:
                 if rc != 0:
                     failures.append(job.variant)
             q.task_done()
-            if rc != 0 and not args.keep_going:
-                while True:
-                    try:
-                        q.get_nowait()
-                        q.task_done()
-                    except Exception:
-                        break
-                return
+            # Always keep going: failures are recorded and reported at the end.
 
     threads: list[threading.Thread] = []
     for gpu_id, slot in workers:

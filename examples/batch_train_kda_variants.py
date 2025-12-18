@@ -70,7 +70,12 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--gpus", type=str, default="0", help="Comma-separated GPU ids, e.g. '0,1,2,3'.")
     p.add_argument("--jobs_per_gpu", type=int, default=1, help="Concurrent jobs per GPU.")
-    p.add_argument("--keep_going", action="store_true", help="Do not stop the batch on first failure.")
+    p.add_argument(
+        "--keep_going",
+        action="store_true",
+        default=True,
+        help="Deprecated (always on): continue running other jobs even if some jobs fail.",
+    )
 
     # Dataset/tokenization
     p.add_argument("--tokenizer", type=str, default="gpt2")
@@ -263,6 +268,7 @@ def _run_job(job: Job, manifest_fh) -> int:
     record: dict[str, Any] = {
         "variant": job.variant,
         "output_dir": str(job.out_dir),
+        "eval_script": VARIANTS[job.variant].eval_script,
         "gpu_id": job.gpu_id,
         "cmd": job.cmd,
         "log": str(job.log_path),
@@ -342,15 +348,7 @@ def main() -> None:
                         failures.append((job.variant, rc))
                 q.task_done()
 
-                if rc != 0 and not args.keep_going:
-                    # Drain the queue to stop other workers ASAP.
-                    while True:
-                        try:
-                            q.get_nowait()
-                            q.task_done()
-                        except Exception:
-                            break
-                    return
+                # Always keep going: failures are recorded and reported at the end.
 
         threads: list[threading.Thread] = []
         for gpu_id, slot in workers:
@@ -370,4 +368,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
