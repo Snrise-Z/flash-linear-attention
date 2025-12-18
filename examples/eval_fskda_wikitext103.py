@@ -2,17 +2,19 @@
 from __future__ import annotations
 
 import argparse
-import math
-import os
-from functools import partial
-from typing import Any
 
 import torch
-from datasets import DatasetDict, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, DefaultDataCollator
 
 import fla  # noqa: F401
+
+from _wikitext103_common import (
+    detect_dtype_eval,
+    evaluate_ppl,
+    load_or_build_tokenized_split,
+    override_attr_on_modules,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,140 +49,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _detect_dtype(dtype_flag: str) -> torch.dtype | None:
-    if dtype_flag == "fp32":
-        return torch.float32
-    if dtype_flag == "fp16":
-        return torch.float16
-    if dtype_flag == "bf16":
-        return torch.bfloat16
-    if dtype_flag != "auto":
-        raise ValueError(f"Unknown dtype: {dtype_flag}")
-    if not torch.cuda.is_available():
-        return torch.float32
-    if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
-
-
-def _normalize_text(example: dict[str, Any], text_column: str) -> dict[str, Any]:
-    text = example.get(text_column, "")
-    if text is None:
-        text = ""
-    return {"text": text.strip()}
-
-
-def _tokenize_batch(examples: dict[str, list[Any]], tokenizer, eos_token_id: int) -> dict[str, list[list[int]]]:
-    texts = [t for t in examples["text"] if t]
-    if not texts:
-        return {"input_ids": []}
-    tokenized = tokenizer(
-        texts,
-        add_special_tokens=False,
-        return_attention_mask=False,
-        return_token_type_ids=False,
-    )["input_ids"]
-    tokenized = [ids + [eos_token_id] for ids in tokenized if len(ids) > 0]
-    return {"input_ids": tokenized}
-
-
-def _group_texts(examples: dict[str, list[list[int]]], seq_len: int) -> dict[str, list[list[int]]]:
-    if not examples["input_ids"]:
-        return {"input_ids": [], "labels": []}
-    concatenated = []
-    for ids in examples["input_ids"]:
-        concatenated.extend(ids)
-    total_len = (len(concatenated) // seq_len) * seq_len
-    if total_len == 0:
-        return {"input_ids": [], "labels": []}
-    input_ids = [concatenated[i : i + seq_len] for i in range(0, total_len, seq_len)]
-    return {"input_ids": input_ids, "labels": input_ids.copy()}
-
-
-def load_or_build_tokenized_split(args: argparse.Namespace, tokenizer) -> Any:
-    if args.tokenized_cache is not None and os.path.isdir(args.tokenized_cache):
-        ds: DatasetDict = load_from_disk(args.tokenized_cache)
-        split_ds = ds[args.split]
-        if args.max_samples is not None:
-            split_ds = split_ds.select(range(min(args.max_samples, len(split_ds))))
-        return split_ds
-
-    raw: DatasetDict = load_dataset(args.dataset_name, args.dataset_config, cache_dir=args.cache_dir)
-    raw = raw.map(partial(_normalize_text, text_column=args.text_column), desc="Normalize text")
-    raw = raw.filter(lambda ex: bool(ex["text"]), desc="Drop empty lines")
-    remove_cols = list(raw["train"].features.keys())
-
-    eos_id = tokenizer.eos_token_id
-    if eos_id is None:
-        raise ValueError("Tokenizer has no eos_token_id; please set a tokenizer with EOS.")
-
-    tokenized = raw.map(
-        partial(_tokenize_batch, tokenizer=tokenizer, eos_token_id=eos_id),
-        batched=True,
-        remove_columns=remove_cols,
-        num_proc=args.num_proc,
-        desc="Tokenize",
-    )
-    lm_ds = tokenized.map(
-        partial(_group_texts, seq_len=args.seq_len),
-        batched=True,
-        num_proc=args.num_proc,
-        desc="Group texts",
-    )
-
-    if args.tokenized_cache is not None:
-        os.makedirs(args.tokenized_cache, exist_ok=True)
-        lm_ds.save_to_disk(args.tokenized_cache)
-
-    split_ds = lm_ds[args.split]
-    if args.max_samples is not None:
-        split_ds = split_ds.select(range(min(args.max_samples, len(split_ds))))
-    return split_ds
-
-
-@torch.no_grad()
-def evaluate_ppl(model, dataloader: DataLoader, device: str) -> dict[str, float]:
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-        out = model(input_ids=input_ids, labels=labels, use_cache=False)
-        tokens = labels.numel()
-        total_loss += float(out.loss) * tokens
-        total_tokens += tokens
-    avg_loss = total_loss / max(total_tokens, 1)
-    return {"loss": avg_loss, "perplexity": math.exp(avg_loss)}
-
-
-def _override_use_qk_l2norm_in_kernel(model, enabled: bool) -> int:
-    changed = 0
-    for module in model.modules():
-        if hasattr(module, "use_qk_l2norm_in_kernel"):
-            module.use_qk_l2norm_in_kernel = enabled
-            changed += 1
-    return changed
-
-
-def _override_fix_lambda(model, fix_lambda: float | None) -> int:
-    changed = 0
-    for module in model.modules():
-        if hasattr(module, "fix_lambda"):
-            module.fix_lambda = fix_lambda
-            changed += 1
-    return changed
-
-
-def _override_share_decay_gate(model, enabled: bool) -> int:
-    changed = 0
-    for module in model.modules():
-        if hasattr(module, "share_decay_gate"):
-            module.share_decay_gate = enabled
-            changed += 1
-    return changed
-
-
 def main() -> None:
     args = parse_args()
     torch.manual_seed(0)
@@ -191,20 +59,31 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dtype = _detect_dtype(args.dtype)
+    dtype = detect_dtype_eval(args.dtype)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(args.device)
 
     if args.use_qk_l2norm_in_kernel:
-        changed = _override_use_qk_l2norm_in_kernel(model, True)
+        changed = override_attr_on_modules(model, "use_qk_l2norm_in_kernel", True)
         print(f"[ablation] set use_qk_l2norm_in_kernel=True on {changed} modules")
     if args.fix_lambda is not None:
-        changed = _override_fix_lambda(model, float(args.fix_lambda))
+        changed = override_attr_on_modules(model, "fix_lambda", float(args.fix_lambda))
         print(f"[ablation] set fix_lambda={args.fix_lambda} on {changed} modules")
     if args.share_decay_gate:
-        changed = _override_share_decay_gate(model, True)
+        changed = override_attr_on_modules(model, "share_decay_gate", True)
         print(f"[ablation] set share_decay_gate=True on {changed} modules")
 
-    dataset = load_or_build_tokenized_split(args, tokenizer)
+    dataset = load_or_build_tokenized_split(
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
+        text_column=args.text_column,
+        cache_dir=args.cache_dir,
+        tokenized_cache=args.tokenized_cache,
+        tokenizer=tokenizer,
+        seq_len=args.seq_len,
+        num_proc=args.num_proc,
+        split=args.split,
+        max_samples=args.max_samples,
+    )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=DefaultDataCollator())
 
     results = evaluate_ppl(model, dataloader, args.device)
@@ -230,3 +109,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -12,7 +12,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
 from fla.layers.attn import Attention
-from fla.layers.fskda import FastSlowKimiDeltaAttention
+from fla.layers.fskda import FastSlowSurpriseKimiDeltaAttention
 from fla.models.fskda.configuration_fskda import FSKDAConfig
 from fla.models.utils import Cache
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, RMSNorm
@@ -51,7 +51,7 @@ class FSKDABlock(nn.Module):
                 layer_idx=layer_idx,
             )
         else:
-            self.attn = FastSlowKimiDeltaAttention(
+            self.attn = FastSlowSurpriseKimiDeltaAttention(
                 mode=config.attn_mode,
                 hidden_size=config.hidden_size,
                 expand_v=config.expand_v,
@@ -132,7 +132,7 @@ class FSKDAPreTrainedModel(PreTrainedModel):
         prenorm_residual_strategy: str | None = None,
         num_residuals_per_layer: int = 2,
     ):
-        if isinstance(module, FastSlowKimiDeltaAttention) and next(module.parameters()).device.type != "meta":
+        if isinstance(module, FastSlowSurpriseKimiDeltaAttention) and next(module.parameters()).device.type != "meta":
             with torch.no_grad():
                 module.A_log.copy_(nn.init.uniform_(module.A_log, a=1, b=16).log())
                 dt = torch.exp(

@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from fla.models.utils import Cache
 
 
-class FastSlowKimiDeltaAttention(nn.Module):
+class FastSlowSurpriseKimiDeltaAttention(nn.Module):
     """
     Fast/Slow Kimi Delta Attention (FSKDA).
 
@@ -64,7 +64,7 @@ class FastSlowKimiDeltaAttention(nn.Module):
         fix_lambda: float | None = None,
         share_decay_gate: bool = False,
         **kwargs,
-    ) -> FastSlowKimiDeltaAttention:
+    ) -> FastSlowSurpriseKimiDeltaAttention:
         super().__init__()
 
         self.mode = mode

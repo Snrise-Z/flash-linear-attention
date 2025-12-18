@@ -2,23 +2,20 @@
 from __future__ import annotations
 
 import argparse
-import math
-import os
-from functools import partial
-from typing import Any
 
 import torch
-from datasets import DatasetDict, load_dataset, load_from_disk
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    DefaultDataCollator,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import fla  # noqa: F401
 from fla.models import FSKDAConfig
+
+from _wikitext103_common import (
+    build_training_args,
+    detect_mixed_precision_train,
+    load_or_build_tokenized_dataset,
+    maybe_preflight_compile,
+    train_with_trainer,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,101 +76,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _detect_mixed_precision(args: argparse.Namespace) -> tuple[bool, bool]:
-    if args.fp16 is True and args.bf16 is True:
-        raise ValueError("Only one of --fp16/--bf16 can be set.")
-    if args.fp16 is True:
-        return True, False
-    if args.bf16 is True:
-        return False, True
-    if not torch.cuda.is_available():
-        return False, False
-    bf16_supported = False
-    if hasattr(torch.cuda, "is_bf16_supported"):
-        try:
-            bf16_supported = bool(torch.cuda.is_bf16_supported())
-        except Exception:
-            bf16_supported = False
-    return (not bf16_supported), bf16_supported
-
-
-def _normalize_text(example: dict[str, Any], text_column: str) -> dict[str, Any]:
-    text = example.get(text_column, "")
-    if text is None:
-        text = ""
-    return {"text": text.strip()}
-
-
-def _tokenize_batch(examples: dict[str, list[Any]], tokenizer, eos_token_id: int) -> dict[str, list[list[int]]]:
-    texts = [t for t in examples["text"] if t]
-    if not texts:
-        return {"input_ids": []}
-    tokenized = tokenizer(
-        texts,
-        add_special_tokens=False,
-        return_attention_mask=False,
-        return_token_type_ids=False,
-    )["input_ids"]
-    tokenized = [ids + [eos_token_id] for ids in tokenized if len(ids) > 0]
-    return {"input_ids": tokenized}
-
-
-def _group_texts(examples: dict[str, list[list[int]]], seq_len: int) -> dict[str, list[list[int]]]:
-    if not examples["input_ids"]:
-        return {"input_ids": [], "labels": []}
-    concatenated = []
-    for ids in examples["input_ids"]:
-        concatenated.extend(ids)
-    total_len = (len(concatenated) // seq_len) * seq_len
-    if total_len == 0:
-        return {"input_ids": [], "labels": []}
-    input_ids = [concatenated[i : i + seq_len] for i in range(0, total_len, seq_len)]
-    return {"input_ids": input_ids, "labels": input_ids.copy()}
-
-
-def load_or_build_tokenized_dataset(args: argparse.Namespace, tokenizer) -> DatasetDict:
-    if args.tokenized_cache is not None and os.path.isdir(args.tokenized_cache):
-        ds: DatasetDict = load_from_disk(args.tokenized_cache)
-        if args.max_train_samples is not None:
-            ds["train"] = ds["train"].select(range(min(args.max_train_samples, len(ds["train"]))))
-        if "validation" in ds and args.max_eval_samples is not None:
-            ds["validation"] = ds["validation"].select(range(min(args.max_eval_samples, len(ds["validation"]))))
-        return ds
-
-    raw: DatasetDict = load_dataset(args.dataset_name, args.dataset_config, cache_dir=args.cache_dir)
-    raw = raw.map(partial(_normalize_text, text_column=args.text_column), desc="Normalize text")
-    raw = raw.filter(lambda ex: bool(ex["text"]), desc="Drop empty lines")
-    remove_cols = list(raw["train"].features.keys())
-
-    eos_id = tokenizer.eos_token_id
-    if eos_id is None:
-        raise ValueError("Tokenizer has no eos_token_id; please set a tokenizer with EOS.")
-
-    tokenized = raw.map(
-        partial(_tokenize_batch, tokenizer=tokenizer, eos_token_id=eos_id),
-        batched=True,
-        remove_columns=remove_cols,
-        num_proc=args.num_proc,
-        desc="Tokenize",
-    )
-    lm_ds = tokenized.map(
-        partial(_group_texts, seq_len=args.seq_len),
-        batched=True,
-        num_proc=args.num_proc,
-        desc="Group texts",
-    )
-
-    if args.tokenized_cache is not None:
-        os.makedirs(args.tokenized_cache, exist_ok=True)
-        lm_ds.save_to_disk(args.tokenized_cache)
-
-    if args.max_train_samples is not None:
-        lm_ds["train"] = lm_ds["train"].select(range(min(args.max_train_samples, len(lm_ds["train"]))))
-    if "validation" in lm_ds and args.max_eval_samples is not None:
-        lm_ds["validation"] = lm_ds["validation"].select(range(min(args.max_eval_samples, len(lm_ds["validation"]))))
-    return lm_ds
-
-
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -183,9 +85,9 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    fp16, bf16 = _detect_mixed_precision(args)
+    fp16, bf16 = detect_mixed_precision_train(args)
 
-    config_kwargs: dict[str, Any] = {}
+    config_kwargs: dict[str, object] = {}
     if args.use_beta_norm is not None:
         config_kwargs["use_beta_norm"] = args.use_beta_norm
     if args.use_qk_l2norm_in_kernel is not None:
@@ -218,70 +120,38 @@ def main() -> None:
     )
     model = AutoModelForCausalLM.from_config(config)
 
-    dataset = load_or_build_tokenized_dataset(args, tokenizer)
+    dataset = load_or_build_tokenized_dataset(
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
+        text_column=args.text_column,
+        cache_dir=args.cache_dir,
+        tokenized_cache=args.tokenized_cache,
+        tokenizer=tokenizer,
+        seq_len=args.seq_len,
+        num_proc=args.num_proc,
+        max_train_samples=args.max_train_samples,
+        max_eval_samples=args.max_eval_samples,
+    )
 
-    if args.preflight_compile and torch.cuda.is_available():
-        mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
-        print(
-            f"[preflight] compiling kernels on {torch.cuda.get_device_name(0)} "
-            f"(cc={torch.cuda.get_device_capability(0)}) dtype={mp_dtype} ...",
-            flush=True,
-        )
-        tmp_model = model.to("cuda", dtype=mp_dtype).train()
-        t = min(args.seq_len, 128)
-        input_ids = torch.randint(0, config.vocab_size, (1, t), device="cuda")
-        out = tmp_model(input_ids=input_ids, labels=input_ids, use_cache=False)
-        out.loss.backward()
-        torch.cuda.synchronize()
-        tmp_model = tmp_model.to("cpu")
-        del tmp_model
-        model = model.to(dtype=torch.float32)
-        print("[preflight] done.", flush=True)
-
-    train_args = TrainingArguments(
-        output_dir=args.output_dir,
-        overwrite_output_dir=True,
-        do_train=True,
-        do_eval=("validation" in dataset),
-        eval_strategy="steps" if "validation" in dataset else "no",
-        eval_steps=args.eval_steps,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        warmup_steps=args.warmup_steps,
-        max_steps=args.max_steps,
-        lr_scheduler_type="cosine",
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=2,
-        seed=args.seed,
+    maybe_preflight_compile(
+        enabled=args.preflight_compile,
+        model=model,
+        vocab_size=config.vocab_size,
+        seq_len=args.seq_len,
         fp16=fp16,
         bf16=bf16,
-        report_to="none",
-        dataloader_num_workers=args.dataloader_num_workers,
-        remove_unused_columns=False,
     )
 
-    trainer = Trainer(
+    train_args = build_training_args(args, fp16=fp16, bf16=bf16, has_validation=("validation" in dataset))
+    train_with_trainer(
         model=model,
-        args=train_args,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset.get("validation"),
-        data_collator=DefaultDataCollator(),
+        dataset=dataset,
+        train_args=train_args,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        output_dir=args.output_dir,
     )
-
-    train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    trainer.save_model(args.output_dir)
-
-    metrics = train_result.metrics
-    if "train_loss" in metrics:
-        metrics["train_ppl"] = math.exp(metrics["train_loss"])
-    trainer.log_metrics("train", metrics)
-    trainer.save_metrics("train", metrics)
-    trainer.save_state()
 
 
 if __name__ == "__main__":
     main()
+
