@@ -75,6 +75,30 @@
 
 ---
 
+## 3.2 极简但靠谱的 3+2 特征工程（当前实现）
+
+为了避免一上来塞太多统计量，SKDA 当前实现采用一个 “3 + 2” 的极简特征组合：
+
+3 个核心统计量：
+1. 误差强度：`log(1 + ||e||_2)`，其中 `e = v_hat - v`
+2. 模型不确定性：来自 **层内辅助 logits** 的熵（可选再加 margin）
+3. key 尺度：`log(1 + ||k||_2)`
+
+2 个结构信息：
+4. 归一化位置：`t/T`（实现上使用 `position_ids/max_position_embeddings` 或由 mask/cuseqlens 推导的相对位置）
+5. head embedding：每个 head 的固定向量（默认不训练）
+
+门控形式：
+- 先拼接成 `s = [s_err, s_unc, s_k, s_pos, head_emb]`
+- 经过小 MLP 得到隐藏表征 `h`
+- `beta = sigmoid(w_beta^T h + b)`
+- `g_raw = amp * normalize(k)`，其中 `amp = (w_amp^T h + b)/normalizer`
+
+说明：
+- “不确定性”不是用最终 LM head 的 vocab logits（attention 层拿不到），而是用一个很轻量的 **辅助 logits 投影** `Linear(hidden_size -> C)` 来近似不确定性，然后计算其熵（可选 margin）。这满足“只依赖当前 token”的并行约束，且工程上更容易落地。
+
+---
+
 ## 4. 代码变更总览（SKDA 相关）
 
 ### 4.1 新增：SKDA layer
@@ -86,15 +110,22 @@
 - 结构上参考 `KimiDeltaAttention`，保留 short conv、输出门、以及 `A_log/dt_bias` 的 decay 参数化。
 - 新增“surprise proxy”子网络（逐 head）：
   - `surprise_v_proj: Linear(d_k -> d_v)`：得到 `v_hat`
-  - 从 `e=v_hat-v` 提取统计量 `s=[L2,L1,cos]`
-  - `surprise_beta_mlp: MLP(3 -> hidden -> 1)`：从统计量产生 `β`
-  - `surprise_alpha_mlp: MLP(3 -> hidden -> 1)`：从统计量产生标量幅度 `amp`
+  - 从 `e=v_hat-v` 提取误差强度 `log1p(||e||2)`
+  - `surprise_uncertainty_proj: Linear(hidden_size -> C)`：产生辅助 logits，计算熵（可选 margin）
+  - 计算 key 尺度 `log1p(||k||2)`、位置 `t/T`、head embedding
+  - `surprise_feat_mlp`：对特征向量做小 MLP
+  - `surprise_beta_head`：输出 `β`
+  - `surprise_amp_head`：输出幅度 `amp`
   - `r = normalize(k)`，`g_raw = amp * r`
 
 新增/更新的配置项：
 - `surprise_gate_logit_normalizer`：控制 `amp` 缩放
 - `surprise_stat_eps`：统计量计算的数值稳定项（L2/cos 分母）
 - `surprise_mlp_hidden_dim`：上述 MLP 的隐藏维度
+- `surprise_head_embed_dim`：head embedding 维度
+- `surprise_trainable_head_embed`：head embedding 是否参与训练（默认否）
+- `surprise_uncertainty_bins`：辅助 logits 的类别数 `C`
+- `surprise_include_margin`：是否把 margin 作为额外不确定性特征
 
 ### 4.2 新增：SKDA HF 模型（Transformers 兼容）
 
@@ -108,6 +139,10 @@
     - `surprise_gate_logit_normalizer: float = 1.0`
     - `surprise_stat_eps: float = 1e-6`
     - `surprise_mlp_hidden_dim: int = 32`
+    - `surprise_head_embed_dim: int = 4`
+    - `surprise_trainable_head_embed: bool = False`
+    - `surprise_uncertainty_bins: int = 64`
+    - `surprise_include_margin: bool = False`
     - `use_qk_l2norm_in_kernel: bool = True`
 - `fla/models/skda/modeling_skda.py`
   - 新模型：`SKDAModel` / `SKDAForCausalLM`

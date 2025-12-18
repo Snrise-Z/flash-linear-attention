@@ -40,6 +40,10 @@ class SKDAConfig(PretrainedConfig):
         surprise_gate_logit_normalizer: float = 1.0,
         surprise_stat_eps: float = 1e-6,
         surprise_mlp_hidden_dim: int = 32,
+        surprise_head_embed_dim: int = 4,
+        surprise_trainable_head_embed: bool = False,
+        surprise_uncertainty_bins: int = 64,
+        surprise_include_margin: bool = False,
         use_qk_l2norm_in_kernel: bool = True,
         **kwargs,
     ):
@@ -72,6 +76,10 @@ class SKDAConfig(PretrainedConfig):
         self.surprise_gate_logit_normalizer = surprise_gate_logit_normalizer
         self.surprise_stat_eps = surprise_stat_eps
         self.surprise_mlp_hidden_dim = surprise_mlp_hidden_dim
+        self.surprise_head_embed_dim = surprise_head_embed_dim
+        self.surprise_trainable_head_embed = surprise_trainable_head_embed
+        self.surprise_uncertainty_bins = surprise_uncertainty_bins
+        self.surprise_include_margin = surprise_include_margin
         self.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
 
         if attn is not None:

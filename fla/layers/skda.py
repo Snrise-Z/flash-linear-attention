@@ -48,10 +48,15 @@ class SurpriseKimiDeltaAttention(nn.Module):
         conv_size: int = 4,
         conv_bias: bool = False,
         layer_idx: int = None,
+        max_position_embeddings: int = 2048,
         norm_eps: float = 1e-5,
         surprise_gate_logit_normalizer: float = 1.0,
         surprise_stat_eps: float = 1e-6,
         surprise_mlp_hidden_dim: int = 32,
+        surprise_head_embed_dim: int = 4,
+        surprise_trainable_head_embed: bool = False,
+        surprise_uncertainty_bins: int = 64,
+        surprise_include_margin: bool = False,
         use_qk_l2norm_in_kernel: bool = True,
         **kwargs,
     ) -> SurpriseKimiDeltaAttention:
@@ -65,6 +70,11 @@ class SurpriseKimiDeltaAttention(nn.Module):
         self.surprise_gate_logit_normalizer = surprise_gate_logit_normalizer
         self.surprise_stat_eps = surprise_stat_eps
         self.surprise_mlp_hidden_dim = surprise_mlp_hidden_dim
+        self.surprise_head_embed_dim = surprise_head_embed_dim
+        self.surprise_trainable_head_embed = surprise_trainable_head_embed
+        self.surprise_uncertainty_bins = surprise_uncertainty_bins
+        self.surprise_include_margin = surprise_include_margin
+        self.max_position_embeddings = max_position_embeddings
 
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
@@ -103,6 +113,12 @@ class SurpriseKimiDeltaAttention(nn.Module):
             raise ValueError("surprise_stat_eps must be > 0")
         if surprise_mlp_hidden_dim <= 0:
             raise ValueError("surprise_mlp_hidden_dim must be > 0")
+        if surprise_head_embed_dim <= 0:
+            raise ValueError("surprise_head_embed_dim must be > 0")
+        if surprise_uncertainty_bins <= 1:
+            raise ValueError("surprise_uncertainty_bins must be > 1")
+        if max_position_embeddings <= 0:
+            raise ValueError("max_position_embeddings must be > 0")
 
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
@@ -138,16 +154,28 @@ class SurpriseKimiDeltaAttention(nn.Module):
         # We compute a small set of statistics from e to reduce noise:
         #   s = [||e||_2, ||e||_1, 1 - cos(v_hat, v)]
         self.surprise_v_proj = nn.Linear(self.head_k_dim, self.head_v_dim, bias=False)
-        self.surprise_beta_mlp = nn.Sequential(
-            nn.Linear(3, surprise_mlp_hidden_dim, bias=True),
+        self.surprise_uncertainty_proj = nn.Linear(hidden_size, surprise_uncertainty_bins, bias=False)
+
+        self.surprise_head_embed = nn.Embedding(self.num_v_heads, surprise_head_embed_dim)
+        if not surprise_trainable_head_embed:
+            self.surprise_head_embed.weight.requires_grad_(False)
+
+        # Feature engineering: 3 core + 2 structure
+        #   1) log1p(||e||2)  (proxy error strength)
+        #   2) entropy(/margin) from auxiliary uncertainty logits
+        #   3) log1p(||k||2)  (key scale)
+        #   4) t/T           (normalized position)
+        #   5) head embedding
+        base_feat_dim = 4 + (1 if surprise_include_margin else 0)
+        feat_dim = base_feat_dim + surprise_head_embed_dim
+        self.surprise_feat_mlp = nn.Sequential(
+            nn.Linear(feat_dim, surprise_mlp_hidden_dim, bias=True),
             nn.SiLU(),
-            nn.Linear(surprise_mlp_hidden_dim, 1, bias=True),
-        )
-        self.surprise_alpha_mlp = nn.Sequential(
-            nn.Linear(3, surprise_mlp_hidden_dim, bias=True),
+            nn.Linear(surprise_mlp_hidden_dim, surprise_mlp_hidden_dim, bias=True),
             nn.SiLU(),
-            nn.Linear(surprise_mlp_hidden_dim, 1, bias=True),
         )
+        self.surprise_beta_head = nn.Linear(surprise_mlp_hidden_dim, 1, bias=True)
+        self.surprise_amp_head = nn.Linear(surprise_mlp_hidden_dim, 1, bias=True)
 
         self.g_proj = nn.Sequential(
             nn.Linear(hidden_size, self.head_v_dim, bias=False),
@@ -195,7 +223,13 @@ class SurpriseKimiDeltaAttention(nn.Module):
         cu_seqlens = kwargs.get("cu_seqlens")
         if attention_mask is not None:
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
+            pos_ids = (indices % q_len).to(torch.long)
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
+        else:
+            pos_ids = kwargs.get("position_ids")
+            if pos_ids is not None:
+                # HF sometimes passes shape [B, T]; after potential flattening it could be [1, total_tokens]
+                pos_ids = pos_ids.reshape(-1).to(torch.long)
 
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None
@@ -224,6 +258,17 @@ class SurpriseKimiDeltaAttention(nn.Module):
             k = F.silu(self.k_proj(hidden_states))
             v = F.silu(self.v_proj(hidden_states))
 
+        # uncertainty features from auxiliary logits (computed on current hidden_states)
+        unc_logits = self.surprise_uncertainty_proj(hidden_states).to(torch.float32)  # [B,T,C]
+        logp = unc_logits.log_softmax(dim=-1)
+        p = logp.exp()
+        entropy = -(p * logp).sum(dim=-1)  # [B,T]
+        if self.surprise_include_margin:
+            top2 = unc_logits.topk(2, dim=-1).values
+            margin = (top2[..., 0] - top2[..., 1]).sigmoid()
+        else:
+            margin = None
+
         q = rearrange(q, "... (h d) -> ... h d", d=self.head_k_dim)
         k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
@@ -231,29 +276,67 @@ class SurpriseKimiDeltaAttention(nn.Module):
         if self.num_v_heads > self.num_heads:
             q, k = (repeat(x, "... h d -> ... (h g) d", g=self.num_v_heads // self.num_heads) for x in (q, k))
 
-        # Surprise proxy error: v_hat = P(k); e = v_hat - v.
+        # Normalized position feature.
+        # - padding-mask path: pos_ids was derived from indices % q_len.
+        # - otherwise: use provided position_ids if any, else [0..q_len-1]
+        if pos_ids is None:
+            pos_ids = torch.arange(q_len, device=hidden_states.device, dtype=torch.long)
+            pos_ids = pos_ids.expand(hidden_states.shape[0], -1).reshape(-1)  # [B*T]
+        if attention_mask is None and cu_seqlens is not None and pos_ids.numel() != hidden_states.shape[1]:
+            # Variable-length packed inputs: build per-token normalized positions per sequence.
+            # cu_seqlens is [N+1] with N sequences, and q_len == total_tokens.
+            total = hidden_states.shape[1]
+            pos = torch.empty(total, device=hidden_states.device, dtype=torch.float32)
+            for s, epos in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist(), strict=False):
+                length = max(epos - s, 1)
+                denom = max(length - 1, 1)
+                pos[s:epos] = torch.arange(length, device=hidden_states.device, dtype=torch.float32) / float(denom)
+            pos_norm = pos.view(hidden_states.shape[0], -1)
+        else:
+            denom = float(max(self.max_position_embeddings - 1, 1))
+            pos_norm = (pos_ids.to(torch.float32) / denom).view(hidden_states.shape[0], -1)
+
+        # Proxy error: v_hat = P(k); e = v_hat - v.
         v_hat = self.surprise_v_proj(k)
         e = v_hat - v
 
-        # Compress e into stable statistics s = [L2, L1, cosine distance]
+        # 1) error strength: log1p(||e||2)
         # Shapes: v_hat/v/e are [..., HV, V]
         eps = self.surprise_stat_eps
         v_hat_f = v_hat.to(torch.float32)
         v_f = v.to(torch.float32)
         e_f = e.to(torch.float32)
-        s_l2 = e_f.square().sum(dim=-1).add(eps).sqrt()
-        s_l1 = e_f.abs().sum(dim=-1)
-        cos_den = v_hat_f.square().sum(dim=-1).add(eps).sqrt() * v_f.square().sum(dim=-1).add(eps).sqrt() + eps
-        cos_sim = (v_hat_f * v_f).sum(dim=-1) / cos_den
-        s_cos = 1.0 - cos_sim
-        s = torch.stack((s_l2, s_l1, s_cos), dim=-1)
+        s_err = torch.log1p(e_f.square().sum(dim=-1).add(eps).sqrt())
 
-        beta = torch.sigmoid(self.surprise_beta_mlp(s).squeeze(-1)).to(v.dtype)
+        # 3) key scale: log1p(||k||2)
+        s_k = torch.log1p(k.to(torch.float32).square().sum(dim=-1).add(eps).sqrt())
 
-        # g_raw must have shape [..., HV, K]. Use a scalar amplitude from MLP and
-        # a simple per-dim reference r_t derived from k (normalized).
+        # Broadcast entropy(/margin)/pos to head dimension and concatenate with head embedding.
+        # entropy: [B,T] -> [B,T,HV]
+        ent_h = repeat(entropy.to(torch.float32), "b t -> b t h", h=self.num_v_heads)
+        pos_h = repeat(pos_norm.to(torch.float32), "b t -> b t h", h=self.num_v_heads)
+
+        head_ids = torch.arange(self.num_v_heads, device=hidden_states.device)
+        head_emb = self.surprise_head_embed(head_ids).to(torch.float32)  # [HV, E]
+        head_emb = repeat(head_emb, "h e -> b t h e", b=hidden_states.shape[0], t=hidden_states.shape[1])
+
+        feats = [
+            s_err.unsqueeze(-1),
+            ent_h.unsqueeze(-1),
+            s_k.unsqueeze(-1),
+            pos_h.unsqueeze(-1),
+        ]
+        if self.surprise_include_margin:
+            margin_h = repeat(margin.to(torch.float32), "b t -> b t h", h=self.num_v_heads)
+            feats.insert(2, margin_h.unsqueeze(-1))
+        x_feat = torch.cat(feats + [head_emb], dim=-1)
+
+        h = self.surprise_feat_mlp(x_feat)
+        beta = torch.sigmoid(self.surprise_beta_head(h).squeeze(-1)).to(v.dtype)
+
+        # g_raw must have shape [..., HV, K]. Use scalar amplitude + normalized k direction.
         r = F.normalize(k.to(torch.float32), p=2, dim=-1).to(k.dtype)
-        amp = (self.surprise_alpha_mlp(s).squeeze(-1) / self.surprise_gate_logit_normalizer).to(k.dtype)
+        amp = (self.surprise_amp_head(h).squeeze(-1) / self.surprise_gate_logit_normalizer).to(k.dtype)
         g_raw = r * amp.unsqueeze(-1)
 
         if self.allow_neg_eigval:
