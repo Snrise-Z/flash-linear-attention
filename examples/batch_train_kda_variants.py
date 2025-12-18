@@ -76,6 +76,18 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Deprecated (always on): continue running other jobs even if some jobs fail.",
     )
+    p.add_argument(
+        "--resume_mode",
+        type=str,
+        default="auto",
+        choices=["off", "auto", "force"],
+        help=(
+            "Resume behavior per variant output_dir: "
+            "'off' always starts fresh; "
+            "'auto' resumes from latest checkpoint if present, otherwise skips if final model exists; "
+            "'force' requires a checkpoint and resumes from it (errors if none)."
+        ),
+    )
 
     # Dataset/tokenization
     p.add_argument("--tokenizer", type=str, default="gpt2")
@@ -236,9 +248,48 @@ def _variant_extra_args(args: argparse.Namespace, variant: str) -> list[str]:
     return cmd
 
 
-def _build_train_cmd(args: argparse.Namespace, variant: str, out_dir: Path) -> list[str]:
+def _find_latest_checkpoint(out_dir: Path) -> Path | None:
+    if not out_dir.is_dir():
+        return None
+    best_step = None
+    best_path: Path | None = None
+    for p in out_dir.iterdir():
+        if not p.is_dir():
+            continue
+        m = re.fullmatch(r"checkpoint-(\d+)", p.name)
+        if not m:
+            continue
+        step = int(m.group(1))
+        if best_step is None or step > best_step:
+            best_step = step
+            best_path = p
+    return best_path
+
+
+def _has_final_model(out_dir: Path) -> bool:
+    if not out_dir.is_dir():
+        return False
+    # HF save_model usually writes config.json + a model weight file.
+    if not (out_dir / "config.json").is_file():
+        return False
+    if (out_dir / "pytorch_model.bin").is_file():
+        return True
+    if (out_dir / "model.safetensors").is_file():
+        return True
+    # Some setups save under adapter_model.bin etc; keep conservative.
+    return False
+
+
+def _build_train_cmd(
+    args: argparse.Namespace,
+    variant: str,
+    out_dir: Path,
+    resume_from_checkpoint: Path | None,
+) -> list[str]:
     spec = VARIANTS[variant]
     cmd = [sys.executable, spec.train_script, "--output_dir", str(out_dir)]
+    if resume_from_checkpoint is not None:
+        cmd += ["--resume_from_checkpoint", str(resume_from_checkpoint)]
     cmd += _base_train_args(args)
     cmd += _variant_extra_args(args, variant)
     if args.extra_args:
@@ -258,6 +309,7 @@ class Job:
     variant: str
     out_dir: Path
     cmd: list[str]
+    resume_from_checkpoint: str | None
     gpu_id: str
     log_path: Path
 
@@ -269,6 +321,7 @@ def _run_job(job: Job, manifest_fh) -> int:
         "variant": job.variant,
         "output_dir": str(job.out_dir),
         "eval_script": VARIANTS[job.variant].eval_script,
+        "resume_from_checkpoint": job.resume_from_checkpoint,
         "gpu_id": job.gpu_id,
         "cmd": job.cmd,
         "log": str(job.log_path),
@@ -327,13 +380,45 @@ def main() -> None:
         jobs.append(Job(variant=v, out_dir=out_dir, cmd=cmd, gpu_id="", log_path=log_path))
 
     q: Queue[Job] = Queue()
+    skipped: list[dict[str, Any]] = []
     for j in jobs:
+        out_dir = j.out_dir
+        latest_ckpt = _find_latest_checkpoint(out_dir)
+        has_final = _has_final_model(out_dir)
+
+        resume_from: Path | None = None
+        if args.resume_mode == "off":
+            resume_from = None
+        elif args.resume_mode == "auto":
+            if latest_ckpt is not None:
+                resume_from = latest_ckpt
+            elif has_final:
+                skipped.append(
+                    {
+                        "variant": j.variant,
+                        "output_dir": str(out_dir),
+                        "status": "skipped_done",
+                    }
+                )
+                continue
+        elif args.resume_mode == "force":
+            if latest_ckpt is None:
+                raise SystemExit(f"[resume_mode=force] No checkpoint found under: {out_dir}")
+            resume_from = latest_ckpt
+        else:
+            raise SystemExit(f"Unknown resume_mode: {args.resume_mode}")
+
+        j.cmd = _build_train_cmd(args, j.variant, out_dir, resume_from)
+        j.resume_from_checkpoint = str(resume_from) if resume_from is not None else None
         q.put(j)
 
     lock = threading.Lock()
     failures: list[tuple[str, int]] = []
     manifest_path = run_root / "runs.jsonl"
     with open(manifest_path, "w", encoding="utf-8") as manifest_fh:
+        for rec in skipped:
+            manifest_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        manifest_fh.flush()
 
         def worker_fn(gpu_id: str, slot: int) -> None:
             while True:
