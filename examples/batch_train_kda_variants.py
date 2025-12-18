@@ -376,8 +376,16 @@ def main() -> None:
     for v in variants:
         out_dir = run_root / v
         log_path = logs_dir / f"{v}.train.log"
-        cmd = _build_train_cmd(args, v, out_dir)
-        jobs.append(Job(variant=v, out_dir=out_dir, cmd=cmd, gpu_id="", log_path=log_path))
+        jobs.append(
+            Job(
+                variant=v,
+                out_dir=out_dir,
+                cmd=[],
+                resume_from_checkpoint=None,
+                gpu_id="",
+                log_path=log_path,
+            )
+        )
 
     q: Queue[Job] = Queue()
     skipped: list[dict[str, Any]] = []
