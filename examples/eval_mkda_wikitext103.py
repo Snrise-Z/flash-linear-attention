@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--generate", action="store_true", help="Also run a small generate() sanity check.")
     p.add_argument("--prompt", type=str, default="The meaning of life is")
     p.add_argument("--max_new_tokens", type=int, default=64)
+    p.add_argument(
+        "--print_microstep_stats",
+        action="store_true",
+        default=False,
+        help="Print micro-step config stats from model config, then continue.",
+    )
 
     return p.parse_args()
 
@@ -173,6 +179,15 @@ def main() -> None:
     dtype = _detect_dtype(args.dtype)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(args.device)
 
+    if args.print_microstep_stats:
+        cfg = getattr(model, "config", None)
+        micro_rank = getattr(cfg, "micro_rank", None)
+        micro_fill_g_raw = getattr(cfg, "micro_fill_g_raw", None)
+        print("[mkda] model_type=", getattr(cfg, "model_type", None), flush=True)
+        print(f"[mkda] micro_rank={micro_rank} micro_fill_g_raw={micro_fill_g_raw}", flush=True)
+        if micro_rank is not None:
+            print(f"[mkda] seq_len={args.seq_len} expanded_len(T*r)={args.seq_len * int(micro_rank)}", flush=True)
+
     dataset = load_or_build_tokenized_split(args, tokenizer)
     collator = DefaultDataCollator()
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collator)
@@ -201,4 +216,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -75,6 +75,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Run one tiny forward/backward to trigger Triton compilation before Trainer starts.",
     )
+    p.add_argument(
+        "--print_microstep_stats",
+        action="store_true",
+        default=False,
+        help="Print micro-step expansion stats and key parameter shapes, then continue.",
+    )
 
     return p.parse_args()
 
@@ -216,6 +222,21 @@ def main() -> None:
     )
     model = AutoModelForCausalLM.from_config(config)
 
+    if args.print_microstep_stats:
+        attn0 = model.model.layers[0].attn
+        print("[mkda] model_type=mkda", flush=True)
+        print(f"[mkda] micro_rank={config.micro_rank} micro_fill_g_raw={config.micro_fill_g_raw}", flush=True)
+        print(f"[mkda] seq_len={args.seq_len} expanded_len(T*r)={args.seq_len * int(config.micro_rank)}", flush=True)
+        print("[mkda] micro-step conventions:", flush=True)
+        print("  - g applied only on first micro-step per token (a=0); a>0 uses ~0 decay", flush=True)
+        print("  - q applied only on last micro-step per token (a=r-1); a<r-1 uses q=0", flush=True)
+        print("  - loss computed on original T outputs (after taking last micro-step)", flush=True)
+        print("[mkda] layer0 attn params:", flush=True)
+        print(f"  - q_proj.weight: {tuple(attn0.q_proj.weight.shape)}", flush=True)
+        print(f"  - k_proj.weight: {tuple(attn0.k_proj.weight.shape)}", flush=True)
+        print(f"  - v_proj.weight: {tuple(attn0.v_proj.weight.shape)}", flush=True)
+        print(f"  - b_proj.weight: {tuple(attn0.b_proj.weight.shape)}", flush=True)
+
     dataset = load_or_build_tokenized_dataset(args, tokenizer)
 
     if args.preflight_compile and torch.cuda.is_available():
@@ -278,4 +299,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
