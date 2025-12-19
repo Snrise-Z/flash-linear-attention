@@ -10,6 +10,7 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
+from transformers.utils.deprecation import deprecate_kwarg
 
 from fla.layers.attn import Attention
 from fla.layers.mkda import MicrostepKimiDeltaAttention
@@ -263,10 +264,7 @@ class MKDAForCausalLM(MKDAPreTrainedModel, GenerationMixin):
         self.model = MKDAModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
         self.criterion = None
-        if config.fuse_cross_entropy:
-            self.criterion = FusedCrossEntropyLoss(inplace_backward=False)
 
         self.post_init()
 
@@ -288,6 +286,7 @@ class MKDAForCausalLM(MKDAPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
+    @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -299,6 +298,7 @@ class MKDAForCausalLM(MKDAPreTrainedModel, GenerationMixin):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        logits_to_keep: int | None = 0,
         **kwargs: Unpack[dict],
     ) -> tuple | CausalLMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -316,19 +316,29 @@ class MKDAForCausalLM(MKDAPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(hidden_states)
+        fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training and labels is not None
 
-        loss = None
+        loss, logits = None, None
+        if not fuse_linear_and_cross_entropy or labels is None:
+            logits = self.lm_head(hidden_states if logits_to_keep is None else hidden_states[:, -logits_to_keep:])
         if labels is not None:
-            if self.config.use_l2warp:
-                hidden_states = l2_warp(hidden_states)
-
-            if self.config.fuse_cross_entropy and self.criterion is not None:
-                # (B, T, V), (B, T)
-                loss = self.criterion(logits, labels)
+            if getattr(self, "criterion", None) is None:
+                if fuse_linear_and_cross_entropy:
+                    criterion = FusedLinearCrossEntropyLoss(use_l2warp=self.config.use_l2warp)
+                elif self.config.fuse_cross_entropy:
+                    criterion = FusedCrossEntropyLoss(inplace_backward=True)
+                else:
+                    criterion = nn.CrossEntropyLoss()
             else:
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.vocab_size), labels.view(-1))
+                criterion = self.criterion
+
+            labels = labels.to(hidden_states.device)
+            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], criterion.ignore_index)), 1)
+            if fuse_linear_and_cross_entropy:
+                loss = criterion(hidden_states, labels, self.lm_head.weight, self.lm_head.bias)
+            else:
+                loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
+                loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -341,4 +351,3 @@ class MKDAForCausalLM(MKDAPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
