@@ -325,6 +325,9 @@ class SurpriseNormalizedKimiDeltaAttention(nn.Module):
             feats.insert(2, margin_h.unsqueeze(-1))
         x_feat = torch.cat(feats + [head_emb], dim=-1)
 
+        # Feature engineering is done in float32 for stability, but model weights may be fp16/bf16.
+        # Ensure MLP input dtype matches MLP weights dtype to avoid matmul dtype mismatch.
+        x_feat = x_feat.to(next(self.surprise_feat_mlp.parameters()).dtype)
         h = self.surprise_feat_mlp(x_feat)
         beta = torch.sigmoid(self.surprise_beta_head(h).squeeze(-1)).to(v.dtype)
 
@@ -388,4 +391,3 @@ class SurpriseNormalizedKimiDeltaAttention(nn.Module):
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_values
-
