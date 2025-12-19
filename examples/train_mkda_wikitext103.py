@@ -16,6 +16,7 @@ from transformers import (
     DefaultDataCollator,
     Trainer,
     TrainingArguments,
+    TrainerCallback,
 )
 
 import fla  # noqa: F401  (registers FLA models/configs with HF auto classes)
@@ -190,6 +191,86 @@ def load_or_build_tokenized_dataset(args: argparse.Namespace, tokenizer) -> Data
     return lm_ds
 
 
+def log_microstep_stats(
+    *,
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    output_dir: str,
+    micro_rank: int,
+    micro_fill_g_raw: float,
+    step: int,
+) -> str:
+    mkda_debug: list[dict[str, Any]] = []
+    with torch.no_grad():
+        model.eval()
+        model(input_ids=input_ids, use_cache=False, mkda_debug=mkda_debug)
+
+    mkda_debug = sorted(mkda_debug, key=lambda x: (x.get("layer_idx") is None, x.get("layer_idx", -1)))
+    stats_path = os.path.join(output_dir, f"mkda_microstep_stats_step{step:06d}.json")
+    payload = {
+        "kind": "mkda_microstep_stats",
+        "phase": "train",
+        "global_step": int(step),
+        "micro_rank": int(micro_rank),
+        "micro_fill_g_raw": float(micro_fill_g_raw),
+        "seq_len_sampled": int(input_ids.shape[1]),
+        "expanded_len_sampled": int(input_ids.shape[1]) * int(micro_rank),
+        "per_layer": mkda_debug,
+    }
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return stats_path
+
+
+class MicrostepStatsCallback(TrainerCallback):
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        input_ids: torch.Tensor,
+        output_dir: str,
+        micro_rank: int,
+        micro_fill_g_raw: float,
+    ) -> None:
+        super().__init__()
+        self.enabled = bool(enabled)
+        self.input_ids = input_ids
+        self.output_dir = output_dir
+        self.micro_rank = int(micro_rank)
+        self.micro_fill_g_raw = float(micro_fill_g_raw)
+        self.interesting_steps = {0, 100, 300, 1000}
+
+    def _maybe_log(self, *, model: torch.nn.Module, state) -> None:
+        if not self.enabled:
+            return
+        if not getattr(state, "is_world_process_zero", True):
+            return
+
+        step = int(getattr(state, "global_step", 0))
+        if step % 1000 != 0 and step not in self.interesting_steps:
+            return
+
+        stats_path = log_microstep_stats(
+            model=model,
+            input_ids=self.input_ids,
+            output_dir=self.output_dir,
+            micro_rank=self.micro_rank,
+            micro_fill_g_raw=self.micro_fill_g_raw,
+            step=step,
+        )
+        print(f"[mkda] wrote {stats_path}", flush=True)
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is not None:
+            self._maybe_log(model=model, state=state)
+        return control
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if model is not None:
+            self._maybe_log(model=model, state=state)
+        return control
+
+
 def main() -> None:
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -226,6 +307,11 @@ def main() -> None:
 
     dataset = load_or_build_tokenized_dataset(args, tokenizer)
 
+    # Prepare a fixed sample for micro-step diagnostics (keep it cheap and deterministic).
+    sample_device = "cuda" if torch.cuda.is_available() else "cpu"
+    example = dataset["train"][0]
+    sample_ids = torch.tensor(example["input_ids"][: min(args.seq_len, 256)], device=sample_device).unsqueeze(0)
+
     if args.print_microstep_stats:
         attn0 = model.model.layers[0].attn
         print("[mkda] exporting micro-step stats...", flush=True)
@@ -240,14 +326,13 @@ def main() -> None:
             flush=True,
         )
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = sample_device
         mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
         model_for_stats = model.to(device, dtype=mp_dtype).eval()
-        example = dataset["train"][0]
-        ids = torch.tensor(example["input_ids"][: min(args.seq_len, 256)], device=device).unsqueeze(0)
+
         mkda_debug: list[dict[str, Any]] = []
         with torch.no_grad():
-            model_for_stats(input_ids=ids, use_cache=False, mkda_debug=mkda_debug)
+            model_for_stats(input_ids=sample_ids, use_cache=False, mkda_debug=mkda_debug)
 
         mkda_debug = sorted(mkda_debug, key=lambda x: (x.get("layer_idx") is None, x.get("layer_idx", -1)))
 
@@ -257,8 +342,8 @@ def main() -> None:
             "phase": "preflight",
             "micro_rank": int(config.micro_rank),
             "micro_fill_g_raw": float(config.micro_fill_g_raw),
-            "seq_len_sampled": int(ids.shape[1]),
-            "expanded_len_sampled": int(ids.shape[1]) * int(config.micro_rank),
+            "seq_len_sampled": int(sample_ids.shape[1]),
+            "expanded_len_sampled": int(sample_ids.shape[1]) * int(config.micro_rank),
             "layer0_shapes": {
                 "q_proj_weight": list(attn0.q_proj.weight.shape),
                 "k_proj_weight": list(attn0.k_proj.weight.shape),
@@ -280,6 +365,7 @@ def main() -> None:
             flush=True,
         )
         model = model_for_stats.to("cpu", dtype=torch.float32)
+        sample_ids = sample_ids.to("cpu")
 
     if args.preflight_compile and torch.cuda.is_available():
         mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
@@ -326,6 +412,15 @@ def main() -> None:
         eval_dataset=dataset.get("validation", None),
         data_collator=DefaultDataCollator(),
         processing_class=tokenizer,
+    )
+    trainer.add_callback(
+        MicrostepStatsCallback(
+            enabled=args.print_microstep_stats,
+            input_ids=sample_ids,
+            output_dir=args.output_dir,
+            micro_rank=int(config.micro_rank),
+            micro_fill_g_raw=float(config.micro_fill_g_raw),
+        )
     )
 
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
