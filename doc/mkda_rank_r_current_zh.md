@@ -499,6 +499,11 @@ o = (o_micro * gamma[None,None,:,None,:]).sum(dim=2)
 - `--micro_fill_g_raw`：gate-in-kernel 路径中，非 first micro-step 的 raw gate 填充值（默认 `-1e4`）
 - `--print_microstep_stats`：导出 micro-step 统计到 `--output_dir`
 
+可选正则项（默认关闭）：
+
+- `--beta_reg_lambda` 与 `--beta_reg_max`：对大的 `β` 做 hinge 惩罚 `E[(max(0,β-β_max))^2]`，以抑制 `β` 过大导致串行近似变得过于“强非线性”；
+- `--orth_reg_lambda`：对每个 token 的 rank 方向 `U_t` 的 Gram 矩阵 `G_t=U_t^T U_t` 的非对角项做二次惩罚（使用归一化方向，惩罚 off-diagonal 的 `cos^2`），鼓励不同 `a` 的方向更接近正交、减弱高阶交叉项。
+
 统计导出文件：
 
 - 预热导出：`mkda_microstep_stats_preflight.json`

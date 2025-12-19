@@ -152,6 +152,7 @@ class MicrostepKimiDeltaAttention(nn.Module):
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
         mkda_debug = kwargs.pop("mkda_debug", None)
+        mkda_reg = kwargs.pop("mkda_reg", None)
         if attention_mask is not None and attention_mask.ndim != 2:
             mask = attention_mask
             while mask.ndim > 2 and mask.shape[1] == 1:
@@ -229,6 +230,35 @@ class MicrostepKimiDeltaAttention(nn.Module):
 
         if self.allow_neg_eigval:
             beta = beta * 2.0
+
+        if isinstance(mkda_reg, dict):
+            beta_reg_lambda = float(mkda_reg.get("beta_reg_lambda", 0.0))
+            orth_reg_lambda = float(mkda_reg.get("orth_reg_lambda", 0.0))
+            reg_loss = mkda_reg.get("reg_loss", None)
+            if not isinstance(reg_loss, torch.Tensor):
+                reg_loss = beta.new_zeros(())
+
+            if beta_reg_lambda > 0.0:
+                beta_max = float(mkda_reg.get("beta_reg_max", 1.0))
+                beta_hinge = (F.relu(beta - beta_max) ** 2).mean()
+                beta_reg = beta_hinge * beta_reg_lambda
+                mkda_reg["beta_reg_loss"] = mkda_reg.get("beta_reg_loss", beta_reg.detach() * 0) + beta_reg
+                reg_loss = reg_loss + beta_reg
+
+            if orth_reg_lambda > 0.0 and self.micro_rank > 1:
+                # Encourage rank directions to be decorrelated/orthogonal by penalizing off-diagonal
+                # Gram terms of normalized U_t (here U_t is k's rank dimension per token).
+                u = F.normalize(k.to(torch.float32), p=2, dim=-1)  # [B,T,H,R,K]
+                gram = torch.matmul(u, u.transpose(-1, -2))  # [B,T,H,R,R]
+                R = gram.shape[-1]
+                eye = torch.eye(R, device=gram.device, dtype=torch.bool).view(1, 1, 1, R, R)
+                off = ~eye
+                orth = (gram.masked_select(off) ** 2).mean()
+                orth_reg = orth * orth_reg_lambda
+                mkda_reg["orth_reg_loss"] = mkda_reg.get("orth_reg_loss", orth_reg.detach() * 0) + orth_reg.to(reg_loss.dtype)
+                reg_loss = reg_loss + orth_reg.to(reg_loss.dtype)
+
+            mkda_reg["reg_loss"] = reg_loss
 
         if mkda_debug is not None:
             with torch.no_grad():

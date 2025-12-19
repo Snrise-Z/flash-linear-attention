@@ -86,6 +86,10 @@ class MKDABlock(nn.Module):
         output_attentions: bool | None = False,
         **kwargs: Unpack[dict],
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
+        # Keep MKDA-only kwargs away from the MLP.
+        mkda_reg = kwargs.pop("mkda_reg", None)
+        mkda_debug = kwargs.pop("mkda_debug", None)
+
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
         hidden_states, attentions, past_key_values = self.attn(
@@ -94,6 +98,8 @@ class MKDABlock(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            mkda_reg=mkda_reg,
+            mkda_debug=mkda_debug,
             **kwargs,
         )
         if self.config.fuse_norm:
@@ -205,6 +211,12 @@ class MKDAModel(MKDAPreTrainedModel):
             inputs_embeds = self.embeddings(input_ids)
         hidden_states = inputs_embeds
 
+        mkda_reg = kwargs.get("mkda_reg", None)
+        if isinstance(mkda_reg, dict) and "reg_loss" not in mkda_reg:
+            mkda_reg["reg_loss"] = hidden_states.new_zeros(())
+            mkda_reg["beta_reg_loss"] = hidden_states.new_zeros(())
+            mkda_reg["orth_reg_loss"] = hidden_states.new_zeros(())
+
         if use_cache and not isinstance(past_key_values, Cache):
             past_key_values = Cache.from_legacy_cache(past_key_values)
 
@@ -304,6 +316,19 @@ class MKDAForCausalLM(MKDAPreTrainedModel, GenerationMixin):
     ) -> tuple | CausalLMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        mkda_reg = None
+        if labels is not None:
+            beta_reg_lambda = float(getattr(self.config, "beta_reg_lambda", 0.0))
+            orth_reg_lambda = float(getattr(self.config, "orth_reg_lambda", 0.0))
+            if beta_reg_lambda > 0.0 or orth_reg_lambda > 0.0:
+                mkda_reg = {
+                    "beta_reg_lambda": beta_reg_lambda,
+                    "beta_reg_max": float(getattr(self.config, "beta_reg_max", 1.0)),
+                    "orth_reg_lambda": orth_reg_lambda,
+                }
+                kwargs = dict(kwargs)
+                kwargs["mkda_reg"] = mkda_reg
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -340,6 +365,10 @@ class MKDAForCausalLM(MKDAPreTrainedModel, GenerationMixin):
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
+            if mkda_reg is not None:
+                reg_loss = mkda_reg.get("reg_loss", None)
+                if isinstance(reg_loss, torch.Tensor):
+                    loss = loss + reg_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]

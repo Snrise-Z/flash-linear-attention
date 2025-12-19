@@ -40,6 +40,10 @@ class MKDAConfig(PretrainedConfig):
         micro_rank: int = 4,
         micro_fill_g_raw: float = -1.0e4,
         micro_readout_mode: str = "mix",
+        # Optional regularizers (default off)
+        beta_reg_lambda: float = 0.0,
+        beta_reg_max: float = 1.0,
+        orth_reg_lambda: float = 0.0,
         **kwargs,
     ):
         self.attn_mode = attn_mode
@@ -71,6 +75,9 @@ class MKDAConfig(PretrainedConfig):
         self.micro_rank = micro_rank
         self.micro_fill_g_raw = micro_fill_g_raw
         self.micro_readout_mode = micro_readout_mode
+        self.beta_reg_lambda = beta_reg_lambda
+        self.beta_reg_max = beta_reg_max
+        self.orth_reg_lambda = orth_reg_lambda
 
         if attn is not None:
             if not isinstance(attn, dict):

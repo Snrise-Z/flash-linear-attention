@@ -56,6 +56,9 @@ def parse_args() -> argparse.Namespace:
         choices=["mix", "last"],
         help="Micro-step readout mode: mix (default, learnable gamma over r) or last (use last micro-step only).",
     )
+    p.add_argument("--beta_reg_lambda", type=float, default=0.0, help="Optional beta hinge regularization strength (default: 0).")
+    p.add_argument("--beta_reg_max", type=float, default=1.0, help="Beta hinge threshold (penalize beta > beta_reg_max).")
+    p.add_argument("--orth_reg_lambda", type=float, default=0.0, help="Optional orthogonality regularization strength (default: 0).")
 
     p.add_argument("--use_short_conv", action="store_true", default=False)
     p.add_argument("--allow_neg_eigval", action="store_true", default=False)
@@ -310,6 +313,9 @@ def main() -> None:
         micro_rank=args.micro_rank,
         micro_fill_g_raw=args.micro_fill_g_raw,
         micro_readout_mode=args.micro_readout_mode,
+        beta_reg_lambda=args.beta_reg_lambda,
+        beta_reg_max=args.beta_reg_max,
+        orth_reg_lambda=args.orth_reg_lambda,
         max_position_embeddings=args.seq_len,
         num_hidden_layers=args.num_hidden_layers,
         vocab_size=tokenizer.vocab_size,
@@ -334,6 +340,12 @@ def main() -> None:
         print("[mkda] exporting micro-step stats...", flush=True)
         print(f"[mkda] micro_rank={config.micro_rank} micro_fill_g_raw={config.micro_fill_g_raw}", flush=True)
         print(f"[mkda] micro_readout_mode={getattr(config, 'micro_readout_mode', None)}", flush=True)
+        print(
+            f"[mkda] regs: beta_reg_lambda={getattr(config,'beta_reg_lambda',None)} "
+            f"beta_reg_max={getattr(config,'beta_reg_max',None)} "
+            f"orth_reg_lambda={getattr(config,'orth_reg_lambda',None)}",
+            flush=True,
+        )
         print(f"[mkda] seq_len={args.seq_len} expanded_len(T*r)={args.seq_len * int(config.micro_rank)}", flush=True)
         print(
             f"[mkda] layer0 shapes q/k/v/b = "
