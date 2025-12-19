@@ -267,21 +267,22 @@ class MicrostepKimiDeltaAttention(nn.Module):
 
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None
         if mode == "chunk":
+            # Gate refinement: compute log-decay in PyTorch, then force "no gate" on non-first micro-steps
+            # by filling g_micro with exact zeros (see microstep expander). This avoids relying on an
+            # extreme raw-gate fill value passing through the kernel-side nonlinearity.
+            g = fused_kda_gate(g=g_raw, A_log=self.A_log, dt_bias=self.dt_bias)
             o_micro, recurrent_state = chunk_kda_rank_r_microstep(
                 q=q,
                 k=k,
                 v=v,
-                g=g_raw,
+                g=g,
                 beta=beta,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
                 micro_readout="all",
                 use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
+                use_gate_in_kernel=False,
                 cu_seqlens=cu_seqlens,
-                fill_g_raw=self.micro_fill_g_raw,
             )
         elif mode == "fused_recurrent":
             g = fused_kda_gate(g=g_raw, A_log=self.A_log, dt_bias=self.dt_bias)

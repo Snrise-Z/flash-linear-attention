@@ -338,6 +338,8 @@ def main() -> None:
         print("  - g applied only on first micro-step per token (a=0); a>0 uses ~0 decay", flush=True)
         print("  - q is read at every micro-step; outputs are mixed with learnable gamma over r", flush=True)
         print("  - loss computed on original T outputs (after micro-step mixing)", flush=True)
+        if args.attn_mode == "chunk":
+            print("  - gate refinement: chunk mode precomputes log-decay via fused_kda_gate; a>0 uses exact g=0", flush=True)
 
         device = sample_device
         mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)

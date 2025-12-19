@@ -52,8 +52,7 @@ def _expand_microsteps_reference(
     return q_micro, k_micro, v_micro, g_micro, beta_micro, R
 
 
-@pytest.mark.parametrize("use_gate_in_kernel", [False, True])
-def test_chunk_kda_rank_r_microstep_matches_naive(use_gate_in_kernel: bool):
+def test_chunk_kda_rank_r_microstep_matches_naive():
     torch.manual_seed(42)
     if IS_INTEL_ALCHEMIST:
         pytest.skip(reason="KDA kernels are not supported on alchemist in CI configs.")
@@ -73,13 +72,11 @@ def test_chunk_kda_rank_r_microstep_matches_naive(use_gate_in_kernel: bool):
     q = F.normalize(q, p=2, dim=-1)
     k = F.normalize(k, p=2, dim=-1)
 
-    A_log, dt_bias = None, None
-    if use_gate_in_kernel:
-        g = torch.randn(B, T, H, D, dtype=torch.float16, device=device)
-        A_log = torch.randn(H, dtype=torch.float32, device=device)
-        dt_bias = torch.randn(H * D, dtype=torch.float32, device=device)
-    else:
-        g = F.logsigmoid(torch.randn(B, T, H, D, dtype=torch.float32, device=device))
+    # Gate refinement: use explicit log-decay g (precomputed), and enforce g=0 for a>0 in the expander.
+    g_raw = torch.randn(B, T, H, D, dtype=torch.float16, device=device)
+    A_log = torch.randn(H, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(H * D, dtype=torch.float32, device=device)
+    g = naive_kda_gate(g_raw, A_log, dt_bias).to(torch.float32)
 
     q_micro, k_micro, v_micro, g_micro, beta_micro, R_out = _expand_microsteps_reference(
         q=q,
@@ -87,7 +84,7 @@ def test_chunk_kda_rank_r_microstep_matches_naive(use_gate_in_kernel: bool):
         v=v,
         g=g,
         beta=beta,
-        use_gate_in_kernel=use_gate_in_kernel,
+        use_gate_in_kernel=False,
         fill_g_raw=fill_g_raw,
         A_log=A_log,
         dt_bias=dt_bias,
@@ -117,10 +114,8 @@ def test_chunk_kda_rank_r_microstep_matches_naive(use_gate_in_kernel: bool):
         output_final_state=True,
         micro_readout="last",
         use_qk_l2norm_in_kernel=False,
-        use_gate_in_kernel=use_gate_in_kernel,
+        use_gate_in_kernel=False,
         fill_g_raw=fill_g_raw,
-        A_log=A_log,
-        dt_bias=dt_bias,
     )
 
     assert_close("o", ref, tri, 0.01)
@@ -137,10 +132,8 @@ def test_chunk_kda_rank_r_microstep_matches_naive(use_gate_in_kernel: bool):
         output_final_state=False,
         micro_readout="all",
         use_qk_l2norm_in_kernel=False,
-        use_gate_in_kernel=use_gate_in_kernel,
+        use_gate_in_kernel=False,
         fill_g_raw=fill_g_raw,
-        A_log=A_log,
-        dt_bias=dt_bias,
     )
     assert_close("o_all", ref_micro.reshape(B, T, R, H, V), tri_all, 0.01)
 

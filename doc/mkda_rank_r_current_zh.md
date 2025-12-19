@@ -41,15 +41,13 @@
 - `g_t ∈ R^K`（gate / decay，按维度逐元素作用在 `K` 上）
 - `β_t ∈ R`（步长/强度，标量）
 
-在当前仓库的实现中，`g` 有两种“语义形态”，对应两个路径：
+在当前实现中，MKDA 统一采用 **PyTorch 侧预先把 raw gate 转成 log-decay** 的路径：
 
-1) **gate-in-kernel**（chunk 模式常用）：
-   - 传入 `g_raw`，kernel 内通过 `kda_gate_fwd` 把 raw gate 变成 log-decay（近似 `log σ(...)` 的形式）。
-   - 对应代码：`fla/ops/kda/gate.py:kda_gate_fwd` 以及 `fla/layers/mkda.py` 里 `use_gate_in_kernel=True`。
+- 先通过 `fused_kda_gate(g_raw, A_log, dt_bias)` 得到 `g`（log-decay）；
+- micro-step 展开时，严格令 token 内 `a>0` 的 micro-step gate 为 **精确的 0**（表示“无衰减”）；
+- 然后调用“接受 log-decay 的版本” kernel（`chunk_kda`/`fused_recurrent_kda` 以 `use_gate_in_kernel=False` 方式使用）。
 
-2) **log-decay**（fused_recurrent 模式常用）：
-   - 传入已经是 log-decay 的 `g`（即 `log decay`），kernel 直接用。
-   - 对应代码：`fla/layers/mkda.py` 里先 `fused_kda_gate(...)` 得到 `g`，再调用 `fused_recurrent_kda_rank_r_microstep`。
+这样在数学上 `g` 的非首 micro-step 真正等于 0，不再依赖“极小 raw 值穿过 kernel-side 非线性后的近似结果”。
 
 本文推导会在数学上把 decay 写成 `exp(g)`（自然指数），代码为了数值与性能往往在内部用 `exp2` 等价实现，这不改变数学含义。
 
@@ -182,7 +180,7 @@ $$
 
 ### 3.3 当前实现的两条关键“micro 规则”（写入侧）
 
-#### 规则 A：衰减只在每个 token 的第一个 micro-step 发生一次
+#### 规则 A：衰减只在每个 token 的第一个 micro-step 发生一次（严格为 0）
 
 数学上我们想要：
 
@@ -196,11 +194,9 @@ $$
 
 - 它先做 `g_rep = g.repeat_interleave(R, dim=1)` 得到 `[B, T*R, H, K]`
 - 再构造 mask `is_first = (micro_rank == 0)`
-- 然后对非 first micro-step：
-  - 若 `use_gate_in_kernel=False`（传入的是 log-decay）：填 `0.0`（表示 `exp(0)=1`，不衰减）
-  - 若 `use_gate_in_kernel=True`（传入的是 raw gate）：填 `fill_g_raw`（默认 `-1e4`），使得 kernel 内计算出的 decay 近似 0（也就“近似不衰减”）
+- 然后对非 first micro-step（`a>0`）直接填 `0.0`（严格意义上的“无衰减”，因为 `exp(0)=1`）。
 
-> 注：raw gate 的“填极小值≈不衰减”是一个实现近似。它依赖于 gate 计算在极小 raw 输入下输出接近 0 的 log-decay，从而 `exp(log_decay)≈1`。这条路径是工程折中，目的是**不改 kernel**。
+注意：当前 MKDA 的 chunk/fused_recurrent 两条路径都在 PyTorch 侧先用 `fused_kda_gate` 得到 log-decay `g`，因此这里填 0 是完全严格的。
 
 #### 规则 B：token 内的 r 次写入是串行的 rank‑1 更新
 
@@ -413,7 +409,7 @@ $$
 
 当前实现强制请求“all micro-step outputs”：
 
-- chunk 模式：`chunk_kda_rank_r_microstep(..., micro_readout="all", use_gate_in_kernel=True, fill_g_raw=...)`
+- chunk 模式：先 `fused_kda_gate` 得到 log-decay，再 `chunk_kda_rank_r_microstep(..., micro_readout="all", use_gate_in_kernel=False)`
 - fused_recurrent 模式：先 `fused_kda_gate` 得到 log-decay，再 `fused_recurrent_kda_rank_r_microstep(..., micro_readout="all")`
 
 因此 `o_micro` 的 shape 是：
@@ -534,4 +530,3 @@ o = (o_micro * gamma[None,None,:,None,:]).sum(dim=2)
 当前 MKDA 的 rank‑r 实现可以用一句严格的话概括：
 
 > 对每个 token `t`，先按 `g_t` 对状态 `S` 做一次逐维衰减，然后用 `r` 个 `(u_{t,a}, y_{t,a}, β_{t,a})` 串行执行 `r` 次 rank‑1 KDA 更新；同时在每个 micro-step 上都用同一个 `q_t` 读出一个 `o_{t,a}`，最后用每层每 head 的 `γ`（softmax 参数化）对 `o_{t,0..r-1}` 做线性混合得到最终输出 `o_t`。整个过程通过把序列从 `T` 展开到 `T*r` 来复用 rank‑1 kernel，不修改 Triton kernel。
-
