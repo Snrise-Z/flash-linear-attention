@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import json
 from functools import partial
 from typing import Any
 
@@ -43,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         "--print_microstep_stats",
         action="store_true",
         default=False,
-        help="Print micro-step config stats from model config, then continue.",
+        help="Export micro-step stats to model dir (and print a short summary), then continue.",
     )
 
     return p.parse_args()
@@ -183,6 +184,7 @@ def main() -> None:
         cfg = getattr(model, "config", None)
         micro_rank = getattr(cfg, "micro_rank", None)
         micro_fill_g_raw = getattr(cfg, "micro_fill_g_raw", None)
+        print("[mkda] exporting micro-step stats...", flush=True)
         print("[mkda] model_type=", getattr(cfg, "model_type", None), flush=True)
         print(f"[mkda] micro_rank={micro_rank} micro_fill_g_raw={micro_fill_g_raw}", flush=True)
         if micro_rank is not None:
@@ -202,19 +204,29 @@ def main() -> None:
                 model.eval()
                 model(input_ids=input_ids, use_cache=False, mkda_debug=mkda_debug)
             mkda_debug = sorted(mkda_debug, key=lambda x: (x.get("layer_idx") is None, x.get("layer_idx", -1)))
-            print("[mkda] per-layer diagnostics (sampled on 1 batch):", flush=True)
-            for d in mkda_debug:
-                li = d.get("layer_idx")
-                print(
-                    f"  - layer={li} "
-                    f"k_offdiag_abs_mean={d['k_gram_offdiag_abs_mean']:.4f} "
-                    f"k_offdiag_cos_abs_mean={d['k_cos_offdiag_abs_mean']:.4f} "
-                    f"beta[min,max]=[{d['beta_min']:.4g},{d['beta_max']:.4g}] "
-                    f"beta_mean={d['beta_mean']:.4g} beta_rms={d['beta_rms']:.4g}",
-                    flush=True,
-                )
-                print(f"    beta_mean_per_r={d['beta_mean_per_r']}", flush=True)
-                print(f"    beta_rms_per_r={d['beta_rms_per_r']}", flush=True)
+            stats_path = os.path.join(args.model, f"mkda_microstep_stats_eval_{args.split}.json")
+            payload = {
+                "kind": "mkda_microstep_stats",
+                "phase": "eval",
+                "split": args.split,
+                "micro_rank": int(micro_rank) if micro_rank is not None else None,
+                "micro_fill_g_raw": float(micro_fill_g_raw) if micro_fill_g_raw is not None else None,
+                "seq_len_sampled": int(input_ids.shape[1]),
+                "expanded_len_sampled": int(input_ids.shape[1]) * int(micro_rank) if micro_rank is not None else None,
+                "per_layer": mkda_debug,
+            }
+            with open(stats_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+            k_cos = [d.get("k_cos_offdiag_abs_mean") for d in mkda_debug if d.get("k_cos_offdiag_abs_mean") is not None]
+            beta_rms = [d.get("beta_rms") for d in mkda_debug if d.get("beta_rms") is not None]
+            k_cos_mean = float(sum(k_cos) / max(len(k_cos), 1))
+            beta_rms_mean = float(sum(beta_rms) / max(len(beta_rms), 1))
+            print(
+                f"[mkda] wrote {stats_path} (layers={len(mkda_debug)}, "
+                f"mean k_offdiag_cos_abs={k_cos_mean:.4g}, mean beta_rms={beta_rms_mean:.4g})",
+                flush=True,
+            )
 
     results = evaluate_ppl(model, dataloader, args.device)
     print(f"split={args.split} seq_len={args.seq_len} batch_size={args.batch_size}")

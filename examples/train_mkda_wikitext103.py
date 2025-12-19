@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import json
 from functools import partial
 from typing import Any
 
@@ -79,7 +80,7 @@ def parse_args() -> argparse.Namespace:
         "--print_microstep_stats",
         action="store_true",
         default=False,
-        help="Print micro-step expansion stats and key parameter shapes, then continue.",
+        help="Export micro-step stats to output_dir (and print a short summary), then continue.",
     )
 
     return p.parse_args()
@@ -191,6 +192,7 @@ def load_or_build_tokenized_dataset(args: argparse.Namespace, tokenizer) -> Data
 
 def main() -> None:
     args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
@@ -226,18 +228,17 @@ def main() -> None:
 
     if args.print_microstep_stats:
         attn0 = model.model.layers[0].attn
-        print("[mkda] model_type=mkda", flush=True)
+        print("[mkda] exporting micro-step stats...", flush=True)
         print(f"[mkda] micro_rank={config.micro_rank} micro_fill_g_raw={config.micro_fill_g_raw}", flush=True)
         print(f"[mkda] seq_len={args.seq_len} expanded_len(T*r)={args.seq_len * int(config.micro_rank)}", flush=True)
-        print("[mkda] micro-step conventions:", flush=True)
-        print("  - g applied only on first micro-step per token (a=0); a>0 uses ~0 decay", flush=True)
-        print("  - q applied only on last micro-step per token (a=r-1); a<r-1 uses q=0", flush=True)
-        print("  - loss computed on original T outputs (after taking last micro-step)", flush=True)
-        print("[mkda] layer0 attn params:", flush=True)
-        print(f"  - q_proj.weight: {tuple(attn0.q_proj.weight.shape)}", flush=True)
-        print(f"  - k_proj.weight: {tuple(attn0.k_proj.weight.shape)}", flush=True)
-        print(f"  - v_proj.weight: {tuple(attn0.v_proj.weight.shape)}", flush=True)
-        print(f"  - b_proj.weight: {tuple(attn0.b_proj.weight.shape)}", flush=True)
+        print(
+            f"[mkda] layer0 shapes q/k/v/b = "
+            f"{tuple(attn0.q_proj.weight.shape)}/"
+            f"{tuple(attn0.k_proj.weight.shape)}/"
+            f"{tuple(attn0.v_proj.weight.shape)}/"
+            f"{tuple(attn0.b_proj.weight.shape)}",
+            flush=True,
+        )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
@@ -249,19 +250,35 @@ def main() -> None:
             model_for_stats(input_ids=ids, use_cache=False, mkda_debug=mkda_debug)
 
         mkda_debug = sorted(mkda_debug, key=lambda x: (x.get("layer_idx") is None, x.get("layer_idx", -1)))
-        print("[mkda] per-layer diagnostics (sampled on 1 sequence):", flush=True)
-        for d in mkda_debug:
-            li = d.get("layer_idx")
-            print(
-                f"  - layer={li} "
-                f"k_offdiag_abs_mean={d['k_gram_offdiag_abs_mean']:.4f} "
-                f"k_offdiag_cos_abs_mean={d['k_cos_offdiag_abs_mean']:.4f} "
-                f"beta[min,max]=[{d['beta_min']:.4g},{d['beta_max']:.4g}] "
-                f"beta_mean={d['beta_mean']:.4g} beta_rms={d['beta_rms']:.4g}",
-                flush=True,
-            )
-            print(f"    beta_mean_per_r={d['beta_mean_per_r']}", flush=True)
-            print(f"    beta_rms_per_r={d['beta_rms_per_r']}", flush=True)
+
+        stats_path = os.path.join(args.output_dir, "mkda_microstep_stats_preflight.json")
+        payload = {
+            "kind": "mkda_microstep_stats",
+            "phase": "preflight",
+            "micro_rank": int(config.micro_rank),
+            "micro_fill_g_raw": float(config.micro_fill_g_raw),
+            "seq_len_sampled": int(ids.shape[1]),
+            "expanded_len_sampled": int(ids.shape[1]) * int(config.micro_rank),
+            "layer0_shapes": {
+                "q_proj_weight": list(attn0.q_proj.weight.shape),
+                "k_proj_weight": list(attn0.k_proj.weight.shape),
+                "v_proj_weight": list(attn0.v_proj.weight.shape),
+                "b_proj_weight": list(attn0.b_proj.weight.shape),
+            },
+            "per_layer": mkda_debug,
+        }
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        k_cos = [d.get("k_cos_offdiag_abs_mean") for d in mkda_debug if d.get("k_cos_offdiag_abs_mean") is not None]
+        beta_rms = [d.get("beta_rms") for d in mkda_debug if d.get("beta_rms") is not None]
+        k_cos_mean = float(sum(k_cos) / max(len(k_cos), 1))
+        beta_rms_mean = float(sum(beta_rms) / max(len(beta_rms), 1))
+        print(
+            f"[mkda] wrote {stats_path} (layers={len(mkda_debug)}, "
+            f"mean k_offdiag_cos_abs={k_cos_mean:.4g}, mean beta_rms={beta_rms_mean:.4g})",
+            flush=True,
+        )
         model = model_for_stats.to("cpu", dtype=torch.float32)
 
     if args.preflight_compile and torch.cuda.is_available():
