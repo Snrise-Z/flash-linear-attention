@@ -200,10 +200,19 @@ def log_microstep_stats(
     micro_fill_g_raw: float,
     step: int,
 ) -> str:
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = input_ids.device
+
+    input_ids = input_ids.to(device, non_blocking=True)
     mkda_debug: list[dict[str, Any]] = []
-    with torch.no_grad():
-        model.eval()
+    was_training = model.training
+    model.eval()
+    with torch.inference_mode():
         model(input_ids=input_ids, use_cache=False, mkda_debug=mkda_debug)
+    if was_training:
+        model.train()
 
     mkda_debug = sorted(mkda_debug, key=lambda x: (x.get("layer_idx") is None, x.get("layer_idx", -1)))
     stats_path = os.path.join(output_dir, f"mkda_microstep_stats_step{step:06d}.json")
