@@ -15,6 +15,7 @@ from .gsa import GatedSlotAttention
 from .hgrn import HGRNAttention
 from .hgrn2 import HGRN2Attention
 from .kda import KimiDeltaAttention
+from .mkda import MicrostepKimiDeltaAttention
 from .fkda import FastSlowKimiDeltaAttention
 from .fskda import FastSlowSurpriseKimiDeltaAttention
 from .fsnkda import FastSlowSurpriseNormalizedKimiDeltaAttention
@@ -53,6 +54,7 @@ __all__ = [
     'HGRNAttention',
     'HGRN2Attention',
     'KimiDeltaAttention',
+    'MicrostepKimiDeltaAttention',
     'FastSlowKimiDeltaAttention',
     'FastSlowSurpriseKimiDeltaAttention',
     'FastSlowSurpriseNormalizedKimiDeltaAttention',
