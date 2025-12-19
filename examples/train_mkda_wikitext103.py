@@ -222,6 +222,8 @@ def main() -> None:
     )
     model = AutoModelForCausalLM.from_config(config)
 
+    dataset = load_or_build_tokenized_dataset(args, tokenizer)
+
     if args.print_microstep_stats:
         attn0 = model.model.layers[0].attn
         print("[mkda] model_type=mkda", flush=True)
@@ -237,7 +239,30 @@ def main() -> None:
         print(f"  - v_proj.weight: {tuple(attn0.v_proj.weight.shape)}", flush=True)
         print(f"  - b_proj.weight: {tuple(attn0.b_proj.weight.shape)}", flush=True)
 
-    dataset = load_or_build_tokenized_dataset(args, tokenizer)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
+        model_for_stats = model.to(device, dtype=mp_dtype).eval()
+        example = dataset["train"][0]
+        ids = torch.tensor(example["input_ids"][: min(args.seq_len, 256)], device=device).unsqueeze(0)
+        mkda_debug: list[dict[str, Any]] = []
+        with torch.no_grad():
+            model_for_stats(input_ids=ids, use_cache=False, mkda_debug=mkda_debug)
+
+        mkda_debug = sorted(mkda_debug, key=lambda x: (x.get("layer_idx") is None, x.get("layer_idx", -1)))
+        print("[mkda] per-layer diagnostics (sampled on 1 sequence):", flush=True)
+        for d in mkda_debug:
+            li = d.get("layer_idx")
+            print(
+                f"  - layer={li} "
+                f"k_offdiag_abs_mean={d['k_gram_offdiag_abs_mean']:.4f} "
+                f"k_offdiag_cos_abs_mean={d['k_cos_offdiag_abs_mean']:.4f} "
+                f"beta[min,max]=[{d['beta_min']:.4g},{d['beta_max']:.4g}] "
+                f"beta_mean={d['beta_mean']:.4g} beta_rms={d['beta_rms']:.4g}",
+                flush=True,
+            )
+            print(f"    beta_mean_per_r={d['beta_mean_per_r']}", flush=True)
+            print(f"    beta_rms_per_r={d['beta_rms_per_r']}", flush=True)
+        model = model_for_stats.to("cpu", dtype=torch.float32)
 
     if args.preflight_compile and torch.cuda.is_available():
         mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)

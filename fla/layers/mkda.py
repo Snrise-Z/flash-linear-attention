@@ -140,6 +140,7 @@ class MicrostepKimiDeltaAttention(nn.Module):
         output_attentions: bool | None = False,
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
+        mkda_debug = kwargs.pop("mkda_debug", None)
         if attention_mask is not None and attention_mask.ndim != 2:
             mask = attention_mask
             while mask.ndim > 2 and mask.shape[1] == 1:
@@ -218,6 +219,43 @@ class MicrostepKimiDeltaAttention(nn.Module):
         if self.allow_neg_eigval:
             beta = beta * 2.0
 
+        if mkda_debug is not None:
+            with torch.no_grad():
+                k_fp32 = k.to(torch.float32)  # [B,T,H,R,K]
+                gram = torch.matmul(k_fp32, k_fp32.transpose(-1, -2))  # [B,T,H,R,R]
+                R = gram.shape[-1]
+                eye = torch.eye(R, device=gram.device, dtype=torch.bool).view(1, 1, 1, R, R)
+                off = ~eye
+
+                gram_off_abs_mean = gram.abs().masked_select(off).mean().item()
+                diag = gram.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)  # [B,T,H,R]
+                denom = (diag[..., :, None] * diag[..., None, :]).sqrt()
+                cos = (gram / denom).clamp(min=-1.0, max=1.0)
+                cos_off_abs_mean = cos.abs().masked_select(off).mean().item()
+
+                beta_fp32 = beta.to(torch.float32)
+                beta_min = beta_fp32.min().item()
+                beta_max = beta_fp32.max().item()
+                beta_mean = beta_fp32.mean().item()
+                beta_rms = beta_fp32.square().mean().sqrt().item()
+                beta_mean_per_r = beta_fp32.mean(dim=(0, 1, 2)).tolist()
+                beta_rms_per_r = beta_fp32.square().mean(dim=(0, 1, 2)).sqrt().tolist()
+
+                mkda_debug.append(
+                    {
+                        "layer_idx": self.layer_idx,
+                        "micro_rank": self.micro_rank,
+                        "k_gram_offdiag_abs_mean": gram_off_abs_mean,
+                        "k_cos_offdiag_abs_mean": cos_off_abs_mean,
+                        "beta_min": beta_min,
+                        "beta_max": beta_max,
+                        "beta_mean": beta_mean,
+                        "beta_rms": beta_rms,
+                        "beta_mean_per_r": beta_mean_per_r,
+                        "beta_rms_per_r": beta_rms_per_r,
+                    }
+                )
+
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None
         if mode == "chunk":
             o, recurrent_state = chunk_kda_rank_r_microstep(
@@ -266,4 +304,3 @@ class MicrostepKimiDeltaAttention(nn.Module):
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_values
-

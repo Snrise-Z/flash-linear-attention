@@ -192,6 +192,30 @@ def main() -> None:
     collator = DefaultDataCollator()
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collator)
 
+    if args.print_microstep_stats:
+        mkda_debug: list[dict[str, Any]] = []
+        batch = next(iter(dataloader), None)
+        if batch is not None:
+            input_ids = batch["input_ids"].to(args.device)
+            input_ids = input_ids[:, : min(input_ids.shape[1], 256)]
+            with torch.no_grad():
+                model.eval()
+                model(input_ids=input_ids, use_cache=False, mkda_debug=mkda_debug)
+            mkda_debug = sorted(mkda_debug, key=lambda x: (x.get("layer_idx") is None, x.get("layer_idx", -1)))
+            print("[mkda] per-layer diagnostics (sampled on 1 batch):", flush=True)
+            for d in mkda_debug:
+                li = d.get("layer_idx")
+                print(
+                    f"  - layer={li} "
+                    f"k_offdiag_abs_mean={d['k_gram_offdiag_abs_mean']:.4f} "
+                    f"k_offdiag_cos_abs_mean={d['k_cos_offdiag_abs_mean']:.4f} "
+                    f"beta[min,max]=[{d['beta_min']:.4g},{d['beta_max']:.4g}] "
+                    f"beta_mean={d['beta_mean']:.4g} beta_rms={d['beta_rms']:.4g}",
+                    flush=True,
+                )
+                print(f"    beta_mean_per_r={d['beta_mean_per_r']}", flush=True)
+                print(f"    beta_rms_per_r={d['beta_rms_per_r']}", flush=True)
+
     results = evaluate_ppl(model, dataloader, args.device)
     print(f"split={args.split} seq_len={args.seq_len} batch_size={args.batch_size}")
     print(f"loss={results['loss']:.6f} ppl={results['perplexity']:.3f}")
