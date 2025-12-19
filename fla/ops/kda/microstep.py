@@ -100,8 +100,14 @@ def _expand_to_microsteps(
     if beta.shape[-1] != R:
         raise ValueError(f"Expected `beta` last dim R={R}, got beta shape={tuple(beta.shape)}.")
 
-    # Expand q: repeat each token R times (we later take the last micro-step output).
+    # Expand q: repeat each token R times, but only keep q on the last micro-step.
+    # This matches the "emit output only after the last micro-step" convention and avoids
+    # spending work on intermediate micro-step outputs.
     q_micro = q.repeat_interleave(R, dim=1)  # [B, T*R, H, K]
+    if R > 1:
+        micro_rank = torch.arange(T * R, device=q.device) % R
+        is_last = micro_rank == (R - 1)
+        q_micro = torch.where(is_last.view(1, -1, 1, 1), q_micro, q.new_zeros(()))
 
     # Expand k,v,beta: move rank to time axis.
     k_micro = k.permute(0, 1, 3, 2, 4).reshape(B, T * R, H, K)
@@ -265,4 +271,3 @@ def fused_recurrent_kda_rank_r_microstep(
     T = TR // R
     o = o_micro.reshape(B, T, R, H, V)[:, :, -1]
     return o, final_state
-
