@@ -115,6 +115,7 @@ def test_chunk_kda_rank_r_microstep_matches_naive(use_gate_in_kernel: bool):
         scale=scale,
         initial_state=h0,
         output_final_state=True,
+        micro_readout="last",
         use_qk_l2norm_in_kernel=False,
         use_gate_in_kernel=use_gate_in_kernel,
         fill_g_raw=fill_g_raw,
@@ -124,6 +125,24 @@ def test_chunk_kda_rank_r_microstep_matches_naive(use_gate_in_kernel: bool):
 
     assert_close("o", ref, tri, 0.01)
     assert_close("ht", ref_ht, tri_ht, 0.01)
+
+    tri_all, _ = chunk_kda_rank_r_microstep(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=h0,
+        output_final_state=False,
+        micro_readout="all",
+        use_qk_l2norm_in_kernel=False,
+        use_gate_in_kernel=use_gate_in_kernel,
+        fill_g_raw=fill_g_raw,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+    assert_close("o_all", ref_micro.reshape(B, T, R, H, V), tri_all, 0.01)
 
 
 def test_fused_recurrent_kda_rank_r_microstep_matches_naive():
@@ -178,9 +197,23 @@ def test_fused_recurrent_kda_rank_r_microstep_matches_naive():
         scale=scale,
         initial_state=h0,
         output_final_state=True,
+        micro_readout="last",
         use_qk_l2norm_in_kernel=False,
     )
 
     assert_close("o", ref, tri, 0.01)
     assert_close("ht", ref_ht, tri_ht, 0.01)
 
+    tri_all, _ = fused_recurrent_kda_rank_r_microstep(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=h0,
+        output_final_state=False,
+        micro_readout="all",
+        use_qk_l2norm_in_kernel=False,
+    )
+    assert_close("o_all", ref_micro.reshape(B, T, R, H, V), tri_all, 0.01)

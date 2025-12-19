@@ -100,14 +100,9 @@ def _expand_to_microsteps(
     if beta.shape[-1] != R:
         raise ValueError(f"Expected `beta` last dim R={R}, got beta shape={tuple(beta.shape)}.")
 
-    # Expand q: repeat each token R times, but only keep q on the last micro-step.
-    # This matches the "emit output only after the last micro-step" convention and avoids
-    # spending work on intermediate micro-step outputs.
+    # Expand q: repeat each token R times so we can read out from any micro-step.
+    # (Micro-step readout mixing happens outside the kernel.)
     q_micro = q.repeat_interleave(R, dim=1)  # [B, T*R, H, K]
-    if R > 1:
-        micro_rank = torch.arange(T * R, device=q.device) % R
-        is_last = micro_rank == (R - 1)
-        q_micro = torch.where(is_last.view(1, -1, 1, 1), q_micro, q.new_zeros(()))
 
     # Expand k,v,beta: move rank to time axis.
     k_micro = k.permute(0, 1, 3, 2, 4).reshape(B, T * R, H, K)
@@ -141,6 +136,7 @@ def chunk_kda_rank_r_microstep(
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
+    micro_readout: str = "last",
     use_qk_l2norm_in_kernel: bool = False,
     use_gate_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
@@ -154,7 +150,7 @@ def chunk_kda_rank_r_microstep(
     Conceptually, for each original token t, we apply:
       1) One decay step using `g_t`
       2) `r` sequential rank-1 updates using (k_{t,a}, v_{t,a}, beta_{t,a})
-      3) Emit output only after the last micro-step (this function returns length-T outputs)
+      3) Optionally read out from any/all micro-steps (controlled by `micro_readout`)
 
     This wrapper implements the approximation by expanding the sequence length from `T` to `T*r`,
     then calling the existing rank-1 `chunk_kda` kernel.
@@ -170,10 +166,15 @@ def chunk_kda_rank_r_microstep(
       - Decay is applied on the first micro-step per token; subsequent micro-steps use no decay.
       - If `use_gate_in_kernel=True`, we set the raw gate for non-first micro-steps to `fill_g_raw`
         (a large negative number), making the computed decay approximately 0.
+      - `micro_readout`:
+          - "last": return only the last micro-step output per token, shape [B,T,H,V]
+          - "all":  return all micro-step outputs per token, shape [B,T,R,H,V]
       - `chunk_indices` is not supported because the sequence length changes; pass `None`.
     """
     if chunk_indices is not None:
         raise ValueError("`chunk_indices` is not supported for micro-step expansion; pass `chunk_indices=None`.")
+    if micro_readout not in ("last", "all"):
+        raise ValueError(f"Unsupported micro_readout={micro_readout!r}; expected 'last' or 'all'.")
 
     q_micro, k_micro, v_micro, g_micro, beta_micro, cu_seqlens_micro, R = _expand_to_microsteps(
         q=q,
@@ -207,7 +208,8 @@ def chunk_kda_rank_r_microstep(
     if TR % R != 0:
         raise RuntimeError(f"Internal error: TR={TR} is not divisible by R={R}.")
     T = TR // R
-    o = o_micro.reshape(B, T, R, H, V)[:, :, -1]
+    o_reshaped = o_micro.reshape(B, T, R, H, V)
+    o = o_reshaped[:, :, -1] if micro_readout == "last" else o_reshaped
     return o, final_state
 
 
@@ -221,6 +223,7 @@ def fused_recurrent_kda_rank_r_microstep(
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
+    micro_readout: str = "last",
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     fill_g_raw: float = -1.0e4,
@@ -239,6 +242,8 @@ def fused_recurrent_kda_rank_r_microstep(
       v:    [B, T, H, R, V] (or [B, T, H, V, R])
       beta: [B, T, H, R]
     """
+    if micro_readout not in ("last", "all"):
+        raise ValueError(f"Unsupported micro_readout={micro_readout!r}; expected 'last' or 'all'.")
     # Reuse the same expander but force "decay g" path by passing use_gate_in_kernel=False.
     q_micro, k_micro, v_micro, g_micro, beta_micro, cu_seqlens_micro, R = _expand_to_microsteps(
         q=q,
@@ -269,5 +274,6 @@ def fused_recurrent_kda_rank_r_microstep(
     if TR % R != 0:
         raise RuntimeError(f"Internal error: TR={TR} is not divisible by R={R}.")
     T = TR // R
-    o = o_micro.reshape(B, T, R, H, V)[:, :, -1]
+    o_reshaped = o_micro.reshape(B, T, R, H, V)
+    o = o_reshaped[:, :, -1] if micro_readout == "last" else o_reshaped
     return o, final_state

@@ -53,6 +53,44 @@ rank-1 路径里这些名字很关键：
 
 ---
 
+## 近似 B 的一个增强：混合 r 个 micro-step 的读出（不改 kernel）
+
+在“串行 rank-1 micro-step 近似 rank-r”的基础上，还可以进一步提升表达能力：
+不只读取最后一个 micro-step 的输出，而是把 token 内 `r` 个 micro-step 的读出做线性混合。
+
+### 设定
+
+对 token `t` 的 micro-step `a=0..r-1`，仍使用相同的写入规则（本节不改写入）：
+
+- gate 只在 `a=0` 生效：`g'_{t,0}=g_t, g'_{t,a>0}=0`
+
+把每个 micro-step 的状态记为 `S_{t,a^+}`，那么我们可以让每个 micro-step 都读一次：
+
+$$
+o_{t,a} = q_t^\top S_{t,a^+}
+$$
+
+然后用一组权重 `\\gamma_a` 做混合读出：
+
+$$
+o_t = \\sum_{a=0}^{r-1} \\gamma_a\\, o_{t,a}
+    = q_t^\\top\\Big(\\sum_{a=0}^{r-1} \\gamma_a S_{t,a^+}\\Big)
+$$
+
+其中 `\\gamma_a` 可以做成每层/每 head 的可学习参数（常用做法：对 logits 做 `softmax` 来保证权重和为 1）。
+
+### 与代码的对应
+
+- micro-step 展开仍由 `fla/ops/kda/microstep.py:_expand_to_microsteps` 完成；
+- `chunk_kda_rank_r_microstep(..., micro_readout="all")` / `fused_recurrent_kda_rank_r_microstep(..., micro_readout="all")`
+  会返回 `o_micro`，shape 为 `[B, T, R, H, Dv]`；
+- 在 `fla/layers/mkda.py:MicrostepKimiDeltaAttention` 中：
+  - 通过 `self.micro_readout_logits`（shape `[H, R]`）得到 `gamma=softmax(logits)`；
+  - 做 `o = (o_micro * gamma).sum(dim=2)` 得到最终 `[B, T, H, Dv]` 输出；
+- 由于混合发生在 PyTorch 侧，**Triton kernel 不需要改**（只是会计算并返回所有 micro-step 的输出）。
+
+---
+
 ## 1. Rank-1 KDA 串行递推：从代码到数学公式（不跳步）
 
 直接对齐 `fla/ops/kda/naive.py:naive_recurrent_kda`。

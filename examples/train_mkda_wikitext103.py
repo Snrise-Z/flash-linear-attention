@@ -334,6 +334,10 @@ def main() -> None:
             f"{tuple(attn0.b_proj.weight.shape)}",
             flush=True,
         )
+        print("[mkda] micro-step conventions:", flush=True)
+        print("  - g applied only on first micro-step per token (a=0); a>0 uses ~0 decay", flush=True)
+        print("  - q is read at every micro-step; outputs are mixed with learnable gamma over r", flush=True)
+        print("  - loss computed on original T outputs (after micro-step mixing)", flush=True)
 
         device = sample_device
         mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)

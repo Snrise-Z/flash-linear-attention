@@ -119,6 +119,15 @@ class MicrostepKimiDeltaAttention(nn.Module):
         )
         self.b_proj = nn.Linear(hidden_size, self.num_heads * micro_rank, bias=False)
 
+        # Micro-step readout mixing weights (per head, over rank dimension).
+        # We parameterize as logits and use softmax during forward for stability.
+        # Initialize to "mostly last step" to match the previous behavior.
+        mix_heads = self.num_v_heads
+        init = torch.full((mix_heads, micro_rank), -8.0, dtype=torch.float32)
+        init[:, -1] = 0.0
+        self.micro_readout_logits = nn.Parameter(init)
+        self.micro_readout_logits._no_weight_decay = True
+
         self.A_log = nn.Parameter(torch.log(torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16)))
         self.A_log._no_weight_decay = True
         self.dt_bias = nn.Parameter(torch.zeros(self.key_dim, dtype=torch.float32))
@@ -258,7 +267,7 @@ class MicrostepKimiDeltaAttention(nn.Module):
 
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None
         if mode == "chunk":
-            o, recurrent_state = chunk_kda_rank_r_microstep(
+            o_micro, recurrent_state = chunk_kda_rank_r_microstep(
                 q=q,
                 k=k,
                 v=v,
@@ -268,6 +277,7 @@ class MicrostepKimiDeltaAttention(nn.Module):
                 dt_bias=self.dt_bias,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
+                micro_readout="all",
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=True,
                 cu_seqlens=cu_seqlens,
@@ -275,7 +285,7 @@ class MicrostepKimiDeltaAttention(nn.Module):
             )
         elif mode == "fused_recurrent":
             g = fused_kda_gate(g=g_raw, A_log=self.A_log, dt_bias=self.dt_bias)
-            o, recurrent_state = fused_recurrent_kda_rank_r_microstep(
+            o_micro, recurrent_state = fused_recurrent_kda_rank_r_microstep(
                 q=q,
                 k=k,
                 v=v,
@@ -283,11 +293,16 @@ class MicrostepKimiDeltaAttention(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
+                micro_readout="all",
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=cu_seqlens,
             )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
+
+        # Mix micro-step outputs: o_micro is [B,T,R,H,Dv] -> o is [B,T,H,Dv]
+        gamma = torch.softmax(self.micro_readout_logits, dim=-1).to(dtype=o_micro.dtype, device=o_micro.device)
+        o = (o_micro * gamma.view(1, 1, self.micro_rank, -1, 1)).sum(dim=2)
 
         if past_key_values is not None:
             past_key_values.update(
