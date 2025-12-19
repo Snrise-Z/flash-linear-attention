@@ -36,6 +36,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp16", "bf16", "fp32"])
+    p.add_argument(
+        "--micro_readout_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "mix", "last"],
+        help="Override MKDA micro-step readout mode at eval time (default: use model config).",
+    )
 
     p.add_argument("--generate", action="store_true", help="Also run a small generate() sanity check.")
     p.add_argument("--prompt", type=str, default="The meaning of life is")
@@ -180,6 +187,12 @@ def main() -> None:
     dtype = _detect_dtype(args.dtype)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(args.device)
 
+    if args.micro_readout_mode != "auto":
+        # Override readout mode without changing weights.
+        for layer in getattr(model, "model", model).layers:
+            if hasattr(layer, "attn") and hasattr(layer.attn, "micro_readout_mode"):
+                layer.attn.micro_readout_mode = args.micro_readout_mode
+
     if args.print_microstep_stats:
         cfg = getattr(model, "config", None)
         micro_rank = getattr(cfg, "micro_rank", None)
@@ -187,6 +200,10 @@ def main() -> None:
         print("[mkda] exporting micro-step stats...", flush=True)
         print("[mkda] model_type=", getattr(cfg, "model_type", None), flush=True)
         print(f"[mkda] micro_rank={micro_rank} micro_fill_g_raw={micro_fill_g_raw}", flush=True)
+        print(
+            f"[mkda] micro_readout_mode={args.micro_readout_mode if args.micro_readout_mode != 'auto' else getattr(cfg, 'micro_readout_mode', None)}",
+            flush=True,
+        )
         if micro_rank is not None:
             print(f"[mkda] seq_len={args.seq_len} expanded_len(T*r)={args.seq_len * int(micro_rank)}", flush=True)
 

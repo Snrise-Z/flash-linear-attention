@@ -39,6 +39,7 @@ class MicrostepKimiDeltaAttention(nn.Module):
         mode: str = "chunk",
         micro_rank: int = 4,
         micro_fill_g_raw: float = -1.0e4,
+        micro_readout_mode: str = "mix",
         use_short_conv: bool = True,
         allow_neg_eigval: bool = False,
         conv_size: int = 4,
@@ -55,6 +56,7 @@ class MicrostepKimiDeltaAttention(nn.Module):
         self.mode = mode
         self.micro_rank = micro_rank
         self.micro_fill_g_raw = float(micro_fill_g_raw)
+        self.micro_readout_mode = str(micro_readout_mode)
         self.allow_neg_eigval = allow_neg_eigval
         self.hidden_size = hidden_size
         self.expand_v = expand_v
@@ -279,7 +281,7 @@ class MicrostepKimiDeltaAttention(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
-                micro_readout="all",
+                micro_readout="all" if self.micro_readout_mode == "mix" else "last",
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=False,
                 cu_seqlens=cu_seqlens,
@@ -294,16 +296,22 @@ class MicrostepKimiDeltaAttention(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
-                micro_readout="all",
+                micro_readout="all" if self.micro_readout_mode == "mix" else "last",
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=cu_seqlens,
             )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
-        # Mix micro-step outputs: o_micro is [B,T,R,H,Dv] -> o is [B,T,H,Dv]
-        gamma = torch.softmax(self.micro_readout_logits, dim=-1).to(dtype=o_micro.dtype, device=o_micro.device)
-        o = (o_micro * gamma.view(1, 1, self.micro_rank, -1, 1)).sum(dim=2)
+        if self.micro_readout_mode == "mix":
+            # Mix micro-step outputs: o_micro is [B,T,R,H,Dv] -> o is [B,T,H,Dv]
+            gamma = torch.softmax(self.micro_readout_logits, dim=-1).to(dtype=o_micro.dtype, device=o_micro.device)
+            o = (o_micro * gamma.view(1, 1, self.micro_rank, -1, 1)).sum(dim=2)
+        elif self.micro_readout_mode == "last":
+            # o_micro is already [B,T,H,Dv]
+            o = o_micro
+        else:
+            raise ValueError(f"Unsupported micro_readout_mode={self.micro_readout_mode!r}; expected 'mix' or 'last'.")
 
         if past_key_values is not None:
             past_key_values.update(

@@ -49,6 +49,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--attn_mode", type=str, default="chunk", choices=["chunk", "fused_recurrent"])
     p.add_argument("--micro_rank", type=int, default=4, help="Rank r for micro-step approximation (sequence expands to T*r).")
     p.add_argument("--micro_fill_g_raw", type=float, default=-1.0e4, help="Raw gate fill value for non-first micro-steps.")
+    p.add_argument(
+        "--micro_readout_mode",
+        type=str,
+        default="mix",
+        choices=["mix", "last"],
+        help="Micro-step readout mode: mix (default, learnable gamma over r) or last (use last micro-step only).",
+    )
 
     p.add_argument("--use_short_conv", action="store_true", default=False)
     p.add_argument("--allow_neg_eigval", action="store_true", default=False)
@@ -302,6 +309,7 @@ def main() -> None:
         num_heads=args.num_heads,
         micro_rank=args.micro_rank,
         micro_fill_g_raw=args.micro_fill_g_raw,
+        micro_readout_mode=args.micro_readout_mode,
         max_position_embeddings=args.seq_len,
         num_hidden_layers=args.num_hidden_layers,
         vocab_size=tokenizer.vocab_size,
@@ -325,6 +333,7 @@ def main() -> None:
         attn0 = model.model.layers[0].attn
         print("[mkda] exporting micro-step stats...", flush=True)
         print(f"[mkda] micro_rank={config.micro_rank} micro_fill_g_raw={config.micro_fill_g_raw}", flush=True)
+        print(f"[mkda] micro_readout_mode={getattr(config, 'micro_readout_mode', None)}", flush=True)
         print(f"[mkda] seq_len={args.seq_len} expanded_len(T*r)={args.seq_len * int(config.micro_rank)}", flush=True)
         print(
             f"[mkda] layer0 shapes q/k/v/b = "

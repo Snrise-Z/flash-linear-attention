@@ -61,6 +61,7 @@ class MKDABlock(nn.Module):
                 num_v_heads=config.num_v_heads,
                 micro_rank=config.micro_rank,
                 micro_fill_g_raw=config.micro_fill_g_raw,
+                micro_readout_mode=getattr(config, "micro_readout_mode", "mix"),
                 use_short_conv=config.use_short_conv,
                 allow_neg_eigval=config.allow_neg_eigval,
                 conv_size=config.conv_size,

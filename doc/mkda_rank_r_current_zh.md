@@ -322,7 +322,12 @@ $$
 
 ## 5. 读出（readout）：从“只读最后一步”到“混合 r 个 micro-step”
 
-当前实现包含一个关键增强：**混合 micro-step 输出**。
+当前实现包含一个关键增强：**混合 micro-step 输出**。同时，也保留了一个可选的“只读最后 micro-step”的模式用于对照实验。
+
+配置项（在 `MKDAConfig` / 启动脚本中暴露）：
+
+- `micro_readout_mode="mix"`（默认）：对 `r` 个 micro-step 输出做可学习混合；
+- `micro_readout_mode="last"`：只使用最后一个 micro-step 的输出（与旧版读出行为一致）。
 
 ### 5.1 旧行为（历史版本）：只读最后 micro-step
 
