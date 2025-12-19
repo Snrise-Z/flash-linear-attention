@@ -10,23 +10,17 @@ from typing import Any
 
 import torch
 from datasets import DatasetDict, load_dataset, load_from_disk
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    DefaultDataCollator,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer, DefaultDataCollator, Trainer, TrainingArguments
 
 import fla  # noqa: F401  (registers FLA models/configs with HF auto classes)
-from fla.models import KDAConfig, MKDAConfig
+from fla.models import KDAConfig
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Train both KDA and MKDA on WikiText-103 for a fixed budget (max_epochs=20), "
-            "save best validation checkpoint, then run test eval using best-val checkpoint."
+            "Train KDA on WikiText-103 for a fixed budget (max_epochs=20), save best validation checkpoint, "
+            "then run test eval using the best-val checkpoint."
         )
     )
 
@@ -43,11 +37,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_eval_samples", type=int, default=None)
     p.add_argument("--max_test_samples", type=int, default=None)
 
-    p.add_argument("--output_root", type=str, default="exp/kda-mkda-wt103-e20")
-    p.add_argument("--resume_kda", type=str, default=None, help="Checkpoint dir to resume KDA training from.")
-    p.add_argument("--resume_mkda", type=str, default=None, help="Checkpoint dir to resume MKDA training from.")
+    p.add_argument("--output_dir", type=str, default="exp/kda-wt103-e20")
+    p.add_argument("--resume_from_checkpoint", type=str, default=None)
 
-    # Shared architecture
+    # Architecture
     p.add_argument("--hidden_size", type=int, default=512)
     p.add_argument("--num_hidden_layers", type=int, default=6)
     p.add_argument("--num_heads", type=int, default=8)
@@ -56,16 +49,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--attn_mode", type=str, default="chunk", choices=["chunk", "fused_recurrent"])
     p.add_argument("--use_short_conv", action="store_true", default=False)
     p.add_argument("--allow_neg_eigval", action="store_true", default=False)
-    p.add_argument("--no_fuse_norm", action="store_true", default=False, help="Disable Triton fused RMSNorm.")
-    p.add_argument("--no_fuse_swiglu", action="store_true", default=False, help="Disable fused SwiGLU.")
-    p.add_argument("--no_fuse_cross_entropy", action="store_true", default=False, help="Disable fused CE.")
-
-    # MKDA-specific
-    p.add_argument("--micro_rank", type=int, default=4)
-    p.add_argument("--micro_readout_mode", type=str, default="mix", choices=["mix", "last"])
-    p.add_argument("--beta_reg_lambda", type=float, default=0.0)
-    p.add_argument("--beta_reg_max", type=float, default=1.0)
-    p.add_argument("--orth_reg_lambda", type=float, default=0.0)
+    p.add_argument("--no_fuse_norm", action="store_true", default=False)
+    p.add_argument("--no_fuse_swiglu", action="store_true", default=False)
+    p.add_argument("--no_fuse_cross_entropy", action="store_true", default=False)
 
     # Training budget
     p.add_argument("--max_epochs", type=int, default=20)
@@ -78,15 +64,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
 
-    p.add_argument("--fp16", action="store_true", default=None, help="Force fp16 training (override auto).")
-    p.add_argument("--bf16", action="store_true", default=None, help="Force bf16 training (override auto).")
-    p.add_argument("--dataloader_num_workers", type=int, default=0, help="DataLoader workers (0 is most stable).")
-    p.add_argument(
-        "--preflight_compile",
-        action="store_true",
-        default=False,
-        help="Run one tiny forward/backward to trigger Triton compilation before Trainer starts.",
-    )
+    p.add_argument("--fp16", action="store_true", default=None)
+    p.add_argument("--bf16", action="store_true", default=None)
+    p.add_argument("--dataloader_num_workers", type=int, default=0)
+    p.add_argument("--preflight_compile", action="store_true", default=False)
 
     return p.parse_args()
 
@@ -211,8 +192,23 @@ def evaluate_split(model, dataset, *, batch_size: int, device: str) -> dict[str,
     return {"loss": avg_loss, "perplexity": math.exp(avg_loss)}
 
 
-def _build_kda_config(args: argparse.Namespace, tokenizer) -> KDAConfig:
-    return KDAConfig(
+def main() -> None:
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
+    tokenizer.model_max_length = int(1e9)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    fp16, bf16 = _detect_mixed_precision(args)
+    dataset = load_or_build_tokenized_dataset(args, tokenizer)
+
+    config = KDAConfig(
         attn_mode=args.attn_mode,
         hidden_size=args.hidden_size,
         expand_v=args.expand_v,
@@ -230,64 +226,23 @@ def _build_kda_config(args: argparse.Namespace, tokenizer) -> KDAConfig:
         fuse_swiglu=not args.no_fuse_swiglu,
         fuse_cross_entropy=not args.no_fuse_cross_entropy,
     )
-
-
-def _build_mkda_config(args: argparse.Namespace, tokenizer) -> MKDAConfig:
-    return MKDAConfig(
-        attn_mode=args.attn_mode,
-        hidden_size=args.hidden_size,
-        expand_v=args.expand_v,
-        use_short_conv=args.use_short_conv,
-        allow_neg_eigval=args.allow_neg_eigval,
-        head_dim=args.head_dim,
-        num_heads=args.num_heads,
-        micro_rank=args.micro_rank,
-        micro_readout_mode=args.micro_readout_mode,
-        beta_reg_lambda=args.beta_reg_lambda,
-        beta_reg_max=args.beta_reg_max,
-        orth_reg_lambda=args.orth_reg_lambda,
-        max_position_embeddings=args.seq_len,
-        num_hidden_layers=args.num_hidden_layers,
-        vocab_size=tokenizer.vocab_size,
-        pad_token_id=tokenizer.pad_token_id,
-        bos_token_id=tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        fuse_norm=not args.no_fuse_norm,
-        fuse_swiglu=not args.no_fuse_swiglu,
-        fuse_cross_entropy=not args.no_fuse_cross_entropy,
-    )
-
-
-def _train_one(
-    *,
-    run_name: str,
-    output_dir: str,
-    resume_from_checkpoint: str | None,
-    config,
-    dataset: DatasetDict,
-    tokenizer,
-    fp16: bool,
-    bf16: bool,
-    args: argparse.Namespace,
-) -> dict[str, Any]:
-    os.makedirs(output_dir, exist_ok=True)
 
     model = AutoModelForCausalLM.from_config(config)
 
     if args.preflight_compile and torch.cuda.is_available():
         mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
-        tmp_model = model.to("cuda", dtype=mp_dtype).train()
+        tmp = model.to("cuda", dtype=mp_dtype).train()
         t = min(args.seq_len, 128)
         input_ids = torch.randint(0, config.vocab_size, (1, t), device="cuda")
-        out = tmp_model(input_ids=input_ids, labels=input_ids, use_cache=False)
+        out = tmp(input_ids=input_ids, labels=input_ids, use_cache=False)
         out.loss.backward()
         torch.cuda.synchronize()
-        tmp_model = tmp_model.to("cpu")
-        del tmp_model
+        tmp = tmp.to("cpu")
+        del tmp
         model = model.to(dtype=torch.float32)
 
     train_args = TrainingArguments(
-        output_dir=output_dir,
+        output_dir=args.output_dir,
         overwrite_output_dir=True,
         do_train=True,
         do_eval=("validation" in dataset),
@@ -296,7 +251,7 @@ def _train_one(
         load_best_model_at_end=("validation" in dataset),
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        save_total_limit=3,
+        save_total_limit=int(args.max_epochs) + 2,
         num_train_epochs=float(args.max_epochs),
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
@@ -323,20 +278,16 @@ def _train_one(
         processing_class=tokenizer,
     )
 
-    train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-
-    # With load_best_model_at_end=True, trainer.model is the best-val model here.
+    train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model()
-    tokenizer.save_pretrained(output_dir)
+    tokenizer.save_pretrained(args.output_dir)
 
     best_ckpt = trainer.state.best_model_checkpoint
-    state_path = os.path.join(output_dir, "trainer_state.json")
+    state_path = os.path.join(args.output_dir, "trainer_state.json")
+    state = {}
     if os.path.exists(state_path):
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
-    else:
-        state = {}
-    state["run_name"] = run_name
     state["best_model_checkpoint"] = best_ckpt
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
@@ -348,73 +299,15 @@ def _train_one(
     trainer.save_metrics("train", metrics)
     trainer.save_state()
 
-    # Test on best-val checkpoint (budget-limited best).
-    test_metrics = None
     if "test" in dataset:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
-        best_model = AutoModelForCausalLM.from_pretrained(best_ckpt or output_dir, torch_dtype=mp_dtype).to(device)
+        best_model = AutoModelForCausalLM.from_pretrained(best_ckpt or args.output_dir, torch_dtype=mp_dtype).to(device)
         test_metrics = evaluate_split(best_model, dataset["test"], batch_size=args.per_device_eval_batch_size, device=device)
-        with open(os.path.join(output_dir, "test_bestval.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(args.output_dir, "test_bestval.json"), "w", encoding="utf-8") as f:
             json.dump({"best_model_checkpoint": best_ckpt, "test": test_metrics}, f, ensure_ascii=False, indent=2)
-        print(f"[{run_name}] test(best-val): loss={test_metrics['loss']:.6f} ppl={test_metrics['perplexity']:.3f}", flush=True)
-
-    return {"train": metrics, "test": test_metrics, "best_model_checkpoint": best_ckpt}
-
-
-def main() -> None:
-    args = parse_args()
-    os.makedirs(args.output_root, exist_ok=True)
-
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
-    tokenizer.model_max_length = int(1e9)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    fp16, bf16 = _detect_mixed_precision(args)
-
-    dataset = load_or_build_tokenized_dataset(args, tokenizer)
-
-    kda_dir = os.path.join(args.output_root, "kda")
-    mkda_dir = os.path.join(args.output_root, "mkda")
-
-    print(f"[budget] max_epochs={args.max_epochs} seq_len={args.seq_len}", flush=True)
-    print(f"[paths] output_root={args.output_root}", flush=True)
-
-    kda_cfg = _build_kda_config(args, tokenizer)
-    mkda_cfg = _build_mkda_config(args, tokenizer)
-
-    kda_out = _train_one(
-        run_name="kda",
-        output_dir=kda_dir,
-        resume_from_checkpoint=args.resume_kda,
-        config=kda_cfg,
-        dataset=dataset,
-        tokenizer=tokenizer,
-        fp16=fp16,
-        bf16=bf16,
-        args=args,
-    )
-    mkda_out = _train_one(
-        run_name="mkda",
-        output_dir=mkda_dir,
-        resume_from_checkpoint=args.resume_mkda,
-        config=mkda_cfg,
-        dataset=dataset,
-        tokenizer=tokenizer,
-        fp16=fp16,
-        bf16=bf16,
-        args=args,
-    )
-
-    with open(os.path.join(args.output_root, "summary_bestval_test.json"), "w", encoding="utf-8") as f:
-        json.dump({"kda": kda_out, "mkda": mkda_out}, f, ensure_ascii=False, indent=2)
+        print(f"[kda] test(best-val): loss={test_metrics['loss']:.6f} ppl={test_metrics['perplexity']:.3f}", flush=True)
 
 
 if __name__ == "__main__":
     main()
-

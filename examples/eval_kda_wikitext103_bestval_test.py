@@ -18,19 +18,10 @@ import fla  # noqa: F401  (registers FLA models/configs with HF auto classes)
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description=(
-            "Evaluate KDA+MKDA runs on WikiText-103 by selecting each run's best validation checkpoint "
-            "(from trainer_state.json) and reporting validation/test perplexity."
-        )
+        description="Evaluate KDA on WikiText-103 using the run's best validation checkpoint (trainer_state.json)."
     )
-
-    p.add_argument(
-        "--output_root",
-        type=str,
-        required=True,
-        help="Root directory containing subdirs 'kda' and 'mkda' (e.g., exp/kda-mkda-wt103-e20).",
-    )
-    p.add_argument("--tokenizer", type=str, default=None, help="Tokenizer name/path (default: use output_root/kda).")
+    p.add_argument("--run_dir", type=str, required=True, help="Training output dir (contains trainer_state.json).")
+    p.add_argument("--tokenizer", type=str, default=None, help="Tokenizer name/path (default: use --run_dir).")
 
     p.add_argument("--dataset_name", type=str, default="wikitext")
     p.add_argument("--dataset_config", type=str, default="wikitext-103-raw-v1")
@@ -46,7 +37,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp16", "bf16", "fp32"])
-
     return p.parse_args()
 
 
@@ -162,61 +152,49 @@ def evaluate_ppl(model, dataset, *, batch_size: int, device: str) -> dict[str, f
     return {"loss": avg_loss, "perplexity": math.exp(avg_loss)}
 
 
-def _best_checkpoint(run_dir: str) -> str:
+def best_checkpoint(run_dir: str) -> str:
     state_path = os.path.join(run_dir, "trainer_state.json")
     if not os.path.exists(state_path):
         raise FileNotFoundError(f"Missing {state_path}")
     with open(state_path, "r", encoding="utf-8") as f:
         state = json.load(f)
-    ckpt = state.get("best_model_checkpoint") or state.get("best_model_checkpoint", None)
+    ckpt = state.get("best_model_checkpoint")
     if not ckpt:
-        raise ValueError(f"No best_model_checkpoint found in {state_path}")
+        raise ValueError(f"No best_model_checkpoint in {state_path}")
     return ckpt
-
-
-def _eval_one(*, name: str, run_dir: str, dataset: DatasetDict, dtype: torch.dtype | None, device: str, batch_size: int):
-    ckpt = _best_checkpoint(run_dir)
-    model = AutoModelForCausalLM.from_pretrained(ckpt, torch_dtype=dtype).to(device)
-
-    out = {"name": name, "best_model_checkpoint": ckpt}
-    if "validation" in dataset:
-        out["validation"] = evaluate_ppl(model, dataset["validation"], batch_size=batch_size, device=device)
-    if "test" in dataset:
-        out["test"] = evaluate_ppl(model, dataset["test"], batch_size=batch_size, device=device)
-
-    out_path = os.path.join(run_dir, "eval_bestval_val_test.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    print(f"[{name}] wrote {out_path}", flush=True)
-    if "validation" in out:
-        print(f"[{name}] val:  loss={out['validation']['loss']:.6f} ppl={out['validation']['perplexity']:.3f}", flush=True)
-    if "test" in out:
-        print(f"[{name}] test: loss={out['test']['loss']:.6f} ppl={out['test']['perplexity']:.3f}", flush=True)
-    return out
 
 
 def main() -> None:
     args = parse_args()
     dtype = _detect_dtype(args.dtype)
 
-    tok_path = args.tokenizer if args.tokenizer is not None else os.path.join(args.output_root, "kda")
+    tok_path = args.tokenizer if args.tokenizer is not None else args.run_dir
     tokenizer = AutoTokenizer.from_pretrained(tok_path, use_fast=True)
     tokenizer.model_max_length = int(1e9)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     dataset = load_or_build_tokenized_dataset(args, tokenizer)
+    ckpt = best_checkpoint(args.run_dir)
 
-    kda_dir = os.path.join(args.output_root, "kda")
-    mkda_dir = os.path.join(args.output_root, "mkda")
+    model = AutoModelForCausalLM.from_pretrained(ckpt, torch_dtype=dtype).to(args.device)
 
-    results = {
-        "output_root": args.output_root,
-        "kda": _eval_one(name="kda", run_dir=kda_dir, dataset=dataset, dtype=dtype, device=args.device, batch_size=args.batch_size),
-        "mkda": _eval_one(name="mkda", run_dir=mkda_dir, dataset=dataset, dtype=dtype, device=args.device, batch_size=args.batch_size),
-    }
-    with open(os.path.join(args.output_root, "eval_summary_bestval_val_test.json"), "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    out = {"run_dir": args.run_dir, "best_model_checkpoint": ckpt}
+    if "validation" in dataset:
+        out["validation"] = evaluate_ppl(model, dataset["validation"], batch_size=args.batch_size, device=args.device)
+    if "test" in dataset:
+        out["test"] = evaluate_ppl(model, dataset["test"], batch_size=args.batch_size, device=args.device)
+
+    out_path = os.path.join(args.run_dir, "eval_bestval_val_test.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+    print(f"[kda] best_model_checkpoint={ckpt}", flush=True)
+    if "validation" in out:
+        print(f"[kda] val:  loss={out['validation']['loss']:.6f} ppl={out['validation']['perplexity']:.3f}", flush=True)
+    if "test" in out:
+        print(f"[kda] test: loss={out['test']['loss']:.6f} ppl={out['test']['perplexity']:.3f}", flush=True)
+    print(f"[kda] wrote {out_path}", flush=True)
 
 
 if __name__ == "__main__":
