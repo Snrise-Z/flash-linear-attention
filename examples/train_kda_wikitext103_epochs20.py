@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_config", type=str, default="wikitext-103-raw-v1", help="HF datasets config.")
     p.add_argument("--text_column", type=str, default="text")
     p.add_argument("--cache_dir", type=str, default=None, help="HF datasets cache_dir.")
-    p.add_argument("--tokenized_cache", type=str, default=None, help="If set, save/load tokenized dataset here.")
+    p.add_argument("--tokenized_cache", type=str, default="./data/wikitext103_gpt2_1024", help="If set, save/load tokenized dataset here.")
 
     p.add_argument("--seq_len", type=int, default=1024)
     p.add_argument("--num_proc", type=int, default=8)
