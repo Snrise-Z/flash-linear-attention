@@ -16,6 +16,7 @@ from .hgrn import HGRNAttention
 from .hgrn2 import HGRN2Attention
 from .kda import KimiDeltaAttention
 from .mkda import MicrostepKimiDeltaAttention
+from .mkda_chunkwise import ChunkwiseMultiKeyDeltaAttention
 from .fkda import FastSlowKimiDeltaAttention
 from .fskda import FastSlowSurpriseKimiDeltaAttention
 from .fsnkda import FastSlowSurpriseNormalizedKimiDeltaAttention
@@ -55,6 +56,7 @@ __all__ = [
     'HGRN2Attention',
     'KimiDeltaAttention',
     'MicrostepKimiDeltaAttention',
+    'ChunkwiseMultiKeyDeltaAttention',
     'FastSlowKimiDeltaAttention',
     'FastSlowSurpriseKimiDeltaAttention',
     'FastSlowSurpriseNormalizedKimiDeltaAttention',

@@ -20,6 +20,7 @@ from .lightning_attn import chunk_lightning_attn, fused_recurrent_lightning_attn
 from .linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
 from .log_linear_attn import chunk_log_linear_attn
 from .mesa_net import chunk_mesa_net
+from .mkda import mkda_chunkwise_parallel, mkda_recurrent
 from .nsa import parallel_nsa
 from .path_attn import parallel_path_attn
 from .retention import chunk_retention, fused_chunk_retention, fused_recurrent_retention, parallel_retention
@@ -46,6 +47,7 @@ __all__ = [
     'chunk_linear_attn', 'fused_chunk_linear_attn', 'fused_recurrent_linear_attn',
     'chunk_log_linear_attn',
     'chunk_mesa_net',
+    'mkda_chunkwise_parallel', 'mkda_recurrent',
     'parallel_nsa',
     'parallel_path_attn',
     'chunk_retention', 'fused_chunk_retention', 'fused_recurrent_retention', 'parallel_retention',

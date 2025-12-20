@@ -40,6 +40,8 @@ class MKDAConfig(PretrainedConfig):
         micro_rank: int = 4,
         micro_fill_g_raw: float = -1.0e4,
         micro_readout_mode: str = "mix",
+        mkda_impl: str = "microstep",  # "microstep" (serial rank-1) or "chunkwise" (block-tri solve)
+        chunk_size: int = 64,
         # Optional regularizers (default off)
         beta_reg_lambda: float = 0.0,
         beta_reg_max: float = 1.0,
@@ -75,6 +77,8 @@ class MKDAConfig(PretrainedConfig):
         self.micro_rank = micro_rank
         self.micro_fill_g_raw = micro_fill_g_raw
         self.micro_readout_mode = micro_readout_mode
+        self.mkda_impl = mkda_impl
+        self.chunk_size = chunk_size
         self.beta_reg_lambda = beta_reg_lambda
         self.beta_reg_max = beta_reg_max
         self.orth_reg_lambda = orth_reg_lambda

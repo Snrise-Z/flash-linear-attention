@@ -14,6 +14,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 
 from fla.layers.attn import Attention
 from fla.layers.mkda import MicrostepKimiDeltaAttention
+from fla.layers.mkda_chunkwise import ChunkwiseMultiKeyDeltaAttention
 from fla.models.mkda.configuration_mkda import MKDAConfig
 from fla.models.utils import Cache
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, RMSNorm
@@ -52,22 +53,41 @@ class MKDABlock(nn.Module):
                 layer_idx=layer_idx,
             )
         else:
-            self.attn = MicrostepKimiDeltaAttention(
-                mode=config.attn_mode,
-                hidden_size=config.hidden_size,
-                expand_v=config.expand_v,
-                head_dim=config.head_dim,
-                num_heads=config.num_heads,
-                num_v_heads=config.num_v_heads,
-                micro_rank=config.micro_rank,
-                micro_fill_g_raw=config.micro_fill_g_raw,
-                micro_readout_mode=getattr(config, "micro_readout_mode", "mix"),
-                use_short_conv=config.use_short_conv,
-                allow_neg_eigval=config.allow_neg_eigval,
-                conv_size=config.conv_size,
-                norm_eps=config.norm_eps,
-                layer_idx=layer_idx,
-            )
+            mkda_impl = getattr(config, "mkda_impl", "microstep")
+            if mkda_impl == "chunkwise":
+                self.attn = ChunkwiseMultiKeyDeltaAttention(
+                    hidden_size=config.hidden_size,
+                    expand_v=config.expand_v,
+                    head_dim=config.head_dim,
+                    num_heads=config.num_heads,
+                    num_v_heads=config.num_v_heads,
+                    num_keys=config.micro_rank,
+                    chunk_size=getattr(config, "chunk_size", 64),
+                    use_short_conv=config.use_short_conv,
+                    allow_neg_eigval=config.allow_neg_eigval,
+                    conv_size=config.conv_size,
+                    norm_eps=config.norm_eps,
+                    layer_idx=layer_idx,
+                )
+            elif mkda_impl == "microstep":
+                self.attn = MicrostepKimiDeltaAttention(
+                    mode=config.attn_mode,
+                    hidden_size=config.hidden_size,
+                    expand_v=config.expand_v,
+                    head_dim=config.head_dim,
+                    num_heads=config.num_heads,
+                    num_v_heads=config.num_v_heads,
+                    micro_rank=config.micro_rank,
+                    micro_fill_g_raw=config.micro_fill_g_raw,
+                    micro_readout_mode=getattr(config, "micro_readout_mode", "mix"),
+                    use_short_conv=config.use_short_conv,
+                    allow_neg_eigval=config.allow_neg_eigval,
+                    conv_size=config.conv_size,
+                    norm_eps=config.norm_eps,
+                    layer_idx=layer_idx,
+                )
+            else:
+                raise ValueError(f"Unknown mkda_impl={mkda_impl!r}; expected 'microstep' or 'chunkwise'.")
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = MKDAMLP(
             hidden_size=config.hidden_size,
