@@ -50,68 +50,79 @@ def mkda_chunkwise_parallel(
     else:
         S0 = initial_state.to(torch.float32).clone()
 
-    q32 = q.to(torch.float32)
-    k32 = k.to(torch.float32)
-    v32 = v.to(torch.float32)
-    la32 = log_alpha.to(torch.float32)
-    b32 = beta.to(torch.float32)
+    # Important: torch.linalg.solve_triangular does not support fp16 on CUDA.
+    # Also, autocast may downcast inputs to fp16 if enabled by the training loop.
+    # We therefore run the entire chunkwise routine in a disabled-autocast region.
+    device_type = q.device.type
+    autocast_ctx = (
+        torch.autocast(device_type=device_type, enabled=False)
+        if hasattr(torch, "autocast")
+        else torch.cuda.amp.autocast(enabled=False)
+    )
 
-    outs: list[torch.Tensor] = []
+    with autocast_ctx:
+        q32 = q.to(torch.float32)
+        k32 = k.to(torch.float32)
+        v32 = v.to(torch.float32)
+        la32 = log_alpha.to(torch.float32)
+        b32 = beta.to(torch.float32)
 
-    for start in range(0, T, chunk_size):
-        end = min(start + chunk_size, T)
-        C = end - start
+        outs: list[torch.Tensor] = []
 
-        q_c = q32[:, start:end]  # [B,C,H,K]
-        k_c = k32[:, start:end]  # [B,C,H,R,K]
-        v_c = v32[:, start:end]  # [B,C,H,R,V]
-        la_c = la32[:, start:end]  # [B,C,H,K]
-        be_c = b32[:, start:end]  # [B,C,H,R]
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            C = end - start
 
-        # g_cum[t] = sum_{j<=t} log_alpha[j]  (within-chunk)
-        g_cum = torch.cumsum(la_c, dim=1)  # [B,C,H,K]
-        F = torch.exp(g_cum)  # [B,C,H,K]
-        F_inv = torch.exp(-g_cum)  # [B,C,H,K]
+            q_c = q32[:, start:end]  # [B,C,H,K]
+            k_c = k32[:, start:end]  # [B,C,H,R,K]
+            v_c = v32[:, start:end]  # [B,C,H,R,V]
+            la_c = la32[:, start:end]  # [B,C,H,K]
+            be_c = b32[:, start:end]  # [B,C,H,R]
 
-        # K_mat: [B,C,H,K,R]
-        K_mat = k_c.permute(0, 1, 2, 4, 3).contiguous()
-        K_plus = K_mat * F.unsqueeze(-1)
-        K_minus = K_mat * F_inv.unsqueeze(-1)
-        K_minus_beta = K_minus * be_c.unsqueeze(-2)  # column-scale by beta
+            # g_cum[t] = sum_{j<=t} log_alpha[j]  (within-chunk)
+            g_cum = torch.cumsum(la_c, dim=1)  # [B,C,H,K]
+            F = torch.exp(g_cum)  # [B,C,H,K]
+            F_inv = torch.exp(-g_cum)  # [B,C,H,K]
 
-        # blocks[s,i] = K_plus[s]^T @ K_minus_beta[i]  => [B,H,C,C,R,R]
-        blocks = torch.einsum("b s h k r, b i h k m -> b h s i r m", K_plus, K_minus_beta)
-        tril = torch.tril(torch.ones(C, C, device=device, dtype=blocks.dtype), diagonal=-1)
-        blocks = blocks * tril.view(1, 1, C, C, 1, 1)
+            # K_mat: [B,C,H,K,R]
+            K_mat = k_c.permute(0, 1, 2, 4, 3).contiguous()
+            K_plus = K_mat * F.unsqueeze(-1)
+            K_minus = K_mat * F_inv.unsqueeze(-1)
+            K_minus_beta = K_minus * be_c.unsqueeze(-2)  # column-scale by beta
 
-        I_R = torch.eye(R, device=device, dtype=blocks.dtype)
-        eye_C = torch.eye(C, device=device, dtype=blocks.dtype)
-        Ablocks = blocks + eye_C.view(1, 1, C, C, 1, 1) * I_R.view(1, 1, 1, 1, R, R)
+            # blocks[s,i] = K_plus[s]^T @ K_minus_beta[i]  => [B,H,C,C,R,R]
+            blocks = torch.einsum("b s h k r, b i h k m -> b h s i r m", K_plus, K_minus_beta)
+            tril = torch.tril(torch.ones(C, C, device=device, dtype=blocks.dtype), diagonal=-1)
+            blocks = blocks * tril.view(1, 1, C, C, 1, 1)
 
-        # flatten: [B,H,C*R,C*R]
-        Aflat = Ablocks.permute(0, 1, 2, 4, 3, 5).reshape(B, H, C * R, C * R)
+            I_R = torch.eye(R, device=device, dtype=blocks.dtype)
+            eye_C = torch.eye(C, device=device, dtype=blocks.dtype)
+            Ablocks = blocks + eye_C.view(1, 1, C, C, 1, 1) * I_R.view(1, 1, 1, 1, R, R)
 
-        # RHS = V - K_plus^T S0
-        pred0 = torch.einsum("b s h k r, b h k v -> b s h r v", K_plus, S0)
-        rhs = v_c - pred0  # [B,C,H,R,V]
-        rhsflat = rhs.permute(0, 2, 1, 3, 4).reshape(B, H, C * R, Vdim)
+            # flatten: [B,H,C*R,C*R]
+            Aflat = Ablocks.permute(0, 1, 2, 4, 3, 5).reshape(B, H, C * R, C * R)
 
-        Eflat = torch.linalg.solve_triangular(Aflat, rhsflat, upper=False, unitriangular=True)
-        E = Eflat.reshape(B, H, C, R, Vdim).permute(0, 2, 1, 3, 4).contiguous()  # [B,C,H,R,V]
+            # RHS = V - K_plus^T S0
+            pred0 = torch.einsum("b s h k r, b h k v -> b s h r v", K_plus, S0)
+            rhs = v_c - pred0  # [B,C,H,R,V]
+            rhsflat = rhs.permute(0, 2, 1, 3, 4).reshape(B, H, C * R, Vdim)
 
-        # W_t = K_t * diag(beta_t) * E_t^T
-        E_beta = E * be_c.unsqueeze(-1)
-        W = torch.einsum("b s h k r, b s h r v -> b s h k v", K_mat, E_beta)  # [B,C,H,K,V]
+            # Force float32 for the solve (avoid any accidental downcast).
+            Eflat = torch.linalg.solve_triangular(Aflat.float(), rhsflat.float(), upper=False, unitriangular=True)
+            E = Eflat.reshape(B, H, C, R, Vdim).permute(0, 2, 1, 3, 4).contiguous()  # [B,C,H,R,V]
 
-        # U_t = cumsum(F_inv * W) and S_t = F * (S0 + U_t)
-        U = torch.cumsum(W * F_inv.unsqueeze(-1), dim=1)
-        S = (S0.unsqueeze(1) + U) * F.unsqueeze(-1)  # [B,C,H,K,V]
+            # W_t = K_t * diag(beta_t) * E_t^T
+            E_beta = E * be_c.unsqueeze(-1)
+            W = torch.einsum("b s h k r, b s h r v -> b s h k v", K_mat, E_beta)  # [B,C,H,K,V]
 
-        o_c = torch.einsum("b s h k v, b s h k -> b s h v", S, q_c * float(scale))
-        outs.append(o_c)
+            # U_t = cumsum(F_inv * W) and S_t = F * (S0 + U_t)
+            U = torch.cumsum(W * F_inv.unsqueeze(-1), dim=1)
+            S = (S0.unsqueeze(1) + U) * F.unsqueeze(-1)  # [B,C,H,K,V]
 
-        S0 = S[:, -1]
+            o_c = torch.einsum("b s h k v, b s h k -> b s h v", S, q_c * float(scale))
+            outs.append(o_c)
 
-    out = torch.cat(outs, dim=1) if outs else q32.new_zeros((B, 0, H, Vdim))
-    return out, (S0 if output_final_state else None)
+            S0 = S[:, -1]
 
+        out = torch.cat(outs, dim=1) if outs else q32.new_zeros((B, 0, H, Vdim))
+        return out, (S0 if output_final_state else None)

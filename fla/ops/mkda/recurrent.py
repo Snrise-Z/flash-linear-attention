@@ -37,34 +37,41 @@ def mkda_recurrent(
     if scale is None:
         scale = Kdim**-0.5
 
-    if initial_state is None:
-        S = torch.zeros(B, H, Kdim, Vdim, device=q.device, dtype=torch.float32)
-    else:
-        S = initial_state.to(torch.float32).clone()
+    device_type = q.device.type
+    autocast_ctx = (
+        torch.autocast(device_type=device_type, enabled=False)
+        if hasattr(torch, "autocast")
+        else torch.cuda.amp.autocast(enabled=False)
+    )
 
-    out = torch.empty(B, T, H, Vdim, device=q.device, dtype=torch.float32)
+    with autocast_ctx:
+        if initial_state is None:
+            S = torch.zeros(B, H, Kdim, Vdim, device=q.device, dtype=torch.float32)
+        else:
+            S = initial_state.to(torch.float32).clone()
 
-    q32 = q.to(torch.float32)
-    k32 = k.to(torch.float32)
-    v32 = v.to(torch.float32)
-    la32 = log_alpha.to(torch.float32)
-    b32 = beta.to(torch.float32)
+        out = torch.empty(B, T, H, Vdim, device=q.device, dtype=torch.float32)
 
-    for t in range(T):
-        alpha = la32[:, t].exp()  # [B,H,K]
-        S = S * alpha.unsqueeze(-1)
+        q32 = q.to(torch.float32)
+        k32 = k.to(torch.float32)
+        v32 = v.to(torch.float32)
+        la32 = log_alpha.to(torch.float32)
+        b32 = beta.to(torch.float32)
 
-        kt = k32[:, t]  # [B,H,R,K]
-        vt = v32[:, t]  # [B,H,R,V]
-        bt = b32[:, t]  # [B,H,R]
+        for t in range(T):
+            alpha = la32[:, t].exp()  # [B,H,K]
+            S = S * alpha.unsqueeze(-1)
 
-        pred = torch.einsum("b h k v, b h r k -> b h r v", S, kt)
-        resid = (vt - pred) * bt.unsqueeze(-1)
-        dS = torch.einsum("b h r k, b h r v -> b h k v", kt, resid)
-        S = S + dS
+            kt = k32[:, t]  # [B,H,R,K]
+            vt = v32[:, t]  # [B,H,R,V]
+            bt = b32[:, t]  # [B,H,R]
 
-        qt = q32[:, t] * float(scale)
-        out[:, t] = torch.einsum("b h k v, b h k -> b h v", S, qt)
+            pred = torch.einsum("b h k v, b h r k -> b h r v", S, kt)
+            resid = (vt - pred) * bt.unsqueeze(-1)
+            dS = torch.einsum("b h r k, b h r v -> b h k v", kt, resid)
+            S = S + dS
 
-    return out, (S if output_final_state else None)
+            qt = q32[:, t] * float(scale)
+            out[:, t] = torch.einsum("b h k v, b h k -> b h v", S, qt)
 
+        return out, (S if output_final_state else None)

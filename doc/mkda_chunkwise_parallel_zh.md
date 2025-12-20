@@ -167,3 +167,12 @@ $$
 - 训练：`examples/train_mkda_chunkwise_wikitext103.py`
 - 评测：`examples/eval_mkda_chunkwise_wikitext103.py`
 
+---
+
+## 7. dtype / autocast 注意事项（非常重要）
+
+`torch.linalg.solve_triangular` 在 CUDA 上**不支持 fp16**。另外在 `Trainer(fp16=True)` 场景下，AMP autocast 可能会把中间张量降精到 fp16，触发：
+
+`RuntimeError: "triangular_solve_cuda" not implemented for 'Half'`
+
+因此仓库实现中在 `mkda_chunkwise_parallel` 内部强制关闭 autocast，并显式把 `Aflat/rhsflat` 转成 `float32` 再求解（参见：`fla/ops/mkda/chunkwise.py`）。
