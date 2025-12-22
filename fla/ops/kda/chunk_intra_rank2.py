@@ -596,8 +596,10 @@ def chunk_kda_rank2_fwd_intra_a_inv(
     B, T, H, K = k.shape
     BT = int(chunk_size)
     BC = 32
-    if BT != 64:
-        raise ValueError(f"chunk_kda_rank2_fwd_intra_a_inv currently requires chunk_size=64, got {chunk_size}.")
+    if BT not in (64, 128):
+        raise ValueError(
+            f"chunk_kda_rank2_fwd_intra_a_inv currently supports chunk_size in {{64,128}}, got {chunk_size}.",
+        )
 
     if cu_seqlens is not None:
         if k.shape[0] != 1:
@@ -633,20 +635,36 @@ def chunk_kda_rank2_fwd_intra_a_inv(
     )
 
     grid = (NT, B * H)
-    chunk_kda_rank2_fwd_kernel_inter_solve_fused_bt64[grid](
-        k=k,
-        g=gk,
-        beta=beta,
-        Akkd=Akkd,
-        Akk=Akk,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        K=K,
-        BT=BT,
-        BC=BC,
-    )
+    if BT == 64:
+        chunk_kda_rank2_fwd_kernel_inter_solve_fused_bt64[grid](
+            k=k,
+            g=gk,
+            beta=beta,
+            Akkd=Akkd,
+            Akk=Akk,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=BC,
+        )
+    else:
+        chunk_kda_rank2_fwd_kernel_inter_solve_fused[grid](
+            k=k,
+            g=gk,
+            beta=beta,
+            Akkd=Akkd,
+            Akk=Akk,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=BC,
+        )
     return Akk
 
 
@@ -662,9 +680,10 @@ def chunk_kda_rank2_bwd_mask_dAkk_within_token(
     Zeroes the within-token coupling entry (i odd, j=i-1) for each sequence.
     """
     B, T, H, BT = dAkk.shape
-    if int(chunk_size) != 64 or BT != 64:
+    if int(chunk_size) != BT or BT not in (64, 128):
         raise ValueError(
-            f"chunk_kda_rank2_bwd_mask_dAkk_within_token requires chunk_size=64 and dAkk[...,BT]==64, got {chunk_size=} {BT=}.",
+            "chunk_kda_rank2_bwd_mask_dAkk_within_token requires chunk_size == dAkk.shape[-1] and "
+            f"BT in {{64,128}}, got {chunk_size=} {BT=}.",
         )
     if cu_seqlens is not None and B != 1:
         raise ValueError("When cu_seqlens is provided, expected batch size B==1 for packed inputs.")
@@ -679,6 +698,6 @@ def chunk_kda_rank2_bwd_mask_dAkk_within_token(
         N=N,
         T=T,
         H=H,
-        BT=64,
+        BT=BT,
     )
     return dAkk

@@ -270,7 +270,9 @@ def prepare_wy_repr_bwd(
     chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
-    BT = 64
+    BT = int(A.shape[-1])
+    if A.shape != (B, T, H, BT):
+        raise ValueError(f"Expected A to be [B,T,H,BT], got shape={tuple(A.shape)} for B={B} T={T} H={H}.")
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)

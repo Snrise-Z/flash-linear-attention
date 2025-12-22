@@ -130,7 +130,7 @@ class ChunkKDARankNFunction(torch.autograd.Function):
             raise ValueError(f"Expected `beta` leading dims to be [B,T,H], got shape={tuple(beta.shape)}.")
 
         # Chunk-local cumsum in ln-space (for chunk_gla exp()).
-        BT_TOK = 16
+        BT_TOK = 32
         chunk_indices_tok = chunk_indices
         if cu_seqlens is not None:
             # Always build indices for the token chunk size used here.
@@ -168,7 +168,7 @@ class ChunkKDARankNFunction(torch.autograd.Function):
         q_flat = torch.zeros((B, T * R_MAX, H, K), device=q.device, dtype=q.dtype)
         q_flat[:, (R_MAX - 1) :: R_MAX] = q
 
-        BT_PSEUDO = 64
+        BT_PSEUDO = 128
         cu_seqlens_p = None if cu_seqlens is None else (cu_seqlens * R_MAX)
         chunk_indices_p = None
         if cu_seqlens_p is not None:
@@ -252,7 +252,7 @@ class ChunkKDARankNFunction(torch.autograd.Function):
         k, _ = _canonicalize_rank_layout(k, name="k", expected_rank=R_in, expected_feat_dim=K)
         v, _ = _canonicalize_rank_layout(v, name="v", expected_rank=R_in, expected_feat_dim=Vdim)
 
-        BT_TOK = 16
+        BT_TOK = 32
         chunk_indices_tok = None
         if cu_seqlens is not None:
             chunk_indices_tok = prepare_chunk_indices(cu_seqlens, BT_TOK)
@@ -287,7 +287,7 @@ class ChunkKDARankNFunction(torch.autograd.Function):
         q_flat = torch.zeros((B, T * R_MAX, H, K), device=q.device, dtype=q.dtype)
         q_flat[:, (R_MAX - 1) :: R_MAX] = q
 
-        BT_PSEUDO = 64
+        BT_PSEUDO = 128
         cu_seqlens_p = None if cu_seqlens is None else (cu_seqlens * R_MAX)
         chunk_indices_p = None
         if cu_seqlens_p is not None:

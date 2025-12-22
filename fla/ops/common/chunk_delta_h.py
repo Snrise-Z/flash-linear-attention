@@ -531,17 +531,17 @@ def chunk_gated_delta_rule_bwd_dhu(
     dht: torch.Tensor | None = None,
     scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
-    chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
+    chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     use_exp2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *q.shape, do.shape[-1]
     # N: the actual number of sequences in the batch with either equal or variable lengths
-    BT = 64
+    BT = int(chunk_size)
     assert K <= 256, "current kernel does not support head dimension being larger than 256."
 
     if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
     else:

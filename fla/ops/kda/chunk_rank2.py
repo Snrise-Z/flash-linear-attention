@@ -113,8 +113,8 @@ class ChunkKDARank2Function(torch.autograd.Function):
                 raise ValueError("Expected initial_state to be float32.")
 
         # Chunk-local cumsum in ln-space (for chunk_gla exp()).
-        # We use a smaller token chunk (32) so that pseudo-time BT=64 remains compatible with existing bwd kernels.
-        BT_TOK = 32
+        # Use BT_PSEUDO=128 so token chunk is 64 (rank-2) and remains compatible with BT in {64,128} kernels.
+        BT_TOK = 64
         BT_PSEUDO = 2 * BT_TOK
         chunk_indices_tok = chunk_indices
         if cu_seqlens is not None:
@@ -225,8 +225,8 @@ class ChunkKDARank2Function(torch.autograd.Function):
         k = _canonicalize_rank2_layout(k, name="k", expected_last_dim=K)
         v = _canonicalize_rank2_layout(v, name="v", expected_last_dim=Vdim)
 
-        BT_TOK = 32
-        BT_PSEUDO = 64
+        BT_TOK = 64
+        BT_PSEUDO = 128
 
         chunk_indices_tok = None
         if cu_seqlens is not None:

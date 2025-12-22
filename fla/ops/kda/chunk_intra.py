@@ -569,7 +569,9 @@ def chunk_kda_fwd_intra(
 ):
     B, T, H, K = k.shape
     BT = chunk_size
-    BC = 16
+    if BT not in (64, 128):
+        raise ValueError(f"chunk_kda_fwd_intra currently supports chunk_size in {{64,128}}, got {chunk_size}.")
+    BC = BT // 4
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)

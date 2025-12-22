@@ -196,6 +196,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         use_gate_in_kernel: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
         chunk_indices: torch.LongTensor | None = None,
+        chunk_size: int = 64,
     ):
         g_org = None
         if use_gate_in_kernel:
@@ -210,7 +211,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
 
-        chunk_size = 64
+        chunk_size = int(chunk_size)
         g = chunk_local_cumsum(
             g=g,
             chunk_size=chunk_size,
@@ -229,6 +230,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
         )
         if use_gate_in_kernel:
             g = None
@@ -296,7 +298,23 @@ class ChunkKDAFunction(torch.autograd.Function):
             dA = dA.to(A_log)
             if dt_bias is not None:
                 dbias = dbias.to(dt_bias)
-        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), dA, dbias, None, dh0, None, None, None, None, None
+        return (
+            dq.to(q),
+            dk.to(k),
+            dv.to(v),
+            dg.to(g),
+            db.to(beta),
+            dA,
+            dbias,
+            None,
+            dh0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 @torch.compiler.disable
@@ -416,6 +434,7 @@ def chunk_kda(
     if use_gate_in_kernel:
         assert "A_log" in kwargs, "A_log must be provided when use_gate_in_kernel=True."
         A_log, dt_bias = kwargs["A_log"], kwargs.get("dt_bias")
+    chunk_size = int(kwargs.pop("chunk_size", 64))
 
     assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
     assert k.shape[-1] <= 256, "Currently we only support key headdim <=256 for KDA :-("
@@ -439,5 +458,6 @@ def chunk_kda(
         use_gate_in_kernel,
         cu_seqlens,
         chunk_indices,
+        chunk_size,
     )
     return o, final_state
