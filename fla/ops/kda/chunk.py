@@ -45,6 +45,7 @@ def chunk_kda_fwd(
         gk=g,
         initial_state=initial_state,
         output_final_state=output_final_state,
+        chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_exp2=True,
@@ -98,6 +99,7 @@ def chunk_kda_bwd(
         gk=g,
         initial_state=initial_state,
         output_final_state=False,
+        chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_exp2=True,
@@ -127,6 +129,7 @@ def chunk_kda_bwd(
         dv=dv,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
         chunk_indices=chunk_indices,
         use_exp2=True,
     )
