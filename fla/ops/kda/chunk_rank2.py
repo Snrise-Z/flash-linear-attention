@@ -56,6 +56,7 @@ class ChunkKDARank2Function(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None,
         chunk_indices: torch.LongTensor | None,
+        chunk_size: int,
     ):
         if q.ndim != 4:
             raise ValueError(f"Expected `q` to be [B,T,H,K], got shape={tuple(q.shape)}.")
@@ -112,14 +113,17 @@ class ChunkKDARank2Function(torch.autograd.Function):
             if initial_state.dtype != torch.float32:
                 raise ValueError("Expected initial_state to be float32.")
 
-        # Chunk-local cumsum in ln-space (for chunk_gla exp()).
-        # Use BT_PSEUDO=128 so token chunk is 64 (rank-2) and remains compatible with BT in {64,128} kernels.
-        BT_TOK = 64
+        BT_TOK = int(chunk_size)
+        if BT_TOK <= 0:
+            raise ValueError(f"chunk_size must be positive, got {BT_TOK}.")
         BT_PSEUDO = 2 * BT_TOK
+
+        # Chunk-local cumsum in ln-space (for chunk_gla exp()).
         chunk_indices_tok = chunk_indices
         if cu_seqlens is not None:
             # Always build indices for the token chunk size used here.
-            chunk_indices_tok = prepare_chunk_indices(cu_seqlens, BT_TOK)
+            if chunk_indices_tok is None:
+                chunk_indices_tok = prepare_chunk_indices(cu_seqlens, BT_TOK)
         g_ln = chunk_local_cumsum(
             g=log_alpha,
             chunk_size=BT_TOK,
@@ -208,6 +212,7 @@ class ChunkKDARank2Function(torch.autograd.Function):
         ctx.scale = float(scale)
         ctx.output_final_state = bool(output_final_state)
         ctx.cu_seqlens = cu_seqlens
+        ctx.chunk_size_tok = int(BT_TOK)
         ctx.k_transposed = bool(k_transposed)
         ctx.v_transposed = bool(v_transposed)
         ctx.initial_state_was_none = initial_state_was_none
@@ -218,6 +223,7 @@ class ChunkKDARank2Function(torch.autograd.Function):
         q, k, v, log_alpha, beta, initial_state = ctx.saved_tensors
         scale = float(ctx.scale)
         cu_seqlens = ctx.cu_seqlens
+        BT_TOK = int(ctx.chunk_size_tok)
         initial_state_was_none = ctx.initial_state_was_none
 
         B, T, H, K = q.shape
@@ -225,8 +231,7 @@ class ChunkKDARank2Function(torch.autograd.Function):
         k = _canonicalize_rank2_layout(k, name="k", expected_last_dim=K)
         v = _canonicalize_rank2_layout(v, name="v", expected_last_dim=Vdim)
 
-        BT_TOK = 64
-        BT_PSEUDO = 128
+        BT_PSEUDO = 2 * BT_TOK
 
         chunk_indices_tok = None
         if cu_seqlens is not None:
@@ -383,7 +388,7 @@ class ChunkKDARank2Function(torch.autograd.Function):
             dv = dv.transpose(-1, -2)
 
         dh0 = None if initial_state_was_none else dh0
-        return dq, dk, dv, dg, db, None, dh0, None, None, None
+        return dq, dk, dv, dg, db, None, dh0, None, None, None, None
 
 
 @torch.compiler.disable
@@ -399,6 +404,7 @@ def chunk_kda_rank2(
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    chunk_size: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Exact per-token rank-2 KDA/MKDA update, chunk-parallel forward in Triton.
@@ -426,4 +432,5 @@ def chunk_kda_rank2(
         output_final_state,
         cu_seqlens,
         chunk_indices,
+        int(chunk_size),
     )
