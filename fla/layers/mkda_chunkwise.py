@@ -12,6 +12,7 @@ from torch.nn import functional as F
 
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import FusedRMSNormGated, ShortConvolution
+from fla.ops.kda import chunk_kda_rank_n
 from fla.ops.mkda import mkda_chunkwise_parallel
 from fla.ops.kda.gate import fused_kda_gate
 
@@ -27,8 +28,8 @@ class ChunkwiseMultiKeyDeltaAttention(nn.Module):
       - inside a chunk, solve a block unit-lower-triangular system once and use a cumsum
       - across chunks, carry the recurrent state S (like other delta-rule methods)
 
-    This implementation is pure PyTorch (uses torch.linalg.solve_triangular) and does not use
-    the existing rank-1 Triton KDA kernels.
+    For `num_keys<=4` on CUDA, this uses the exact Triton MKDA kernel (`chunk_kda_rank_n`).
+    Otherwise it falls back to a reference PyTorch implementation (`mkda_chunkwise_parallel`).
     """
 
     def __init__(
@@ -165,24 +166,40 @@ class ChunkwiseMultiKeyDeltaAttention(nn.Module):
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             last_state = past_key_values[self.layer_idx]
 
-        # This pure PyTorch implementation does not support packed cu_seqlens; for fixed-length
-        # training/eval (WikiText grouped chunks) attention_mask should be None.
         cu_seqlens = kwargs.get("cu_seqlens")
-        if cu_seqlens is not None:
-            raise ValueError("Chunkwise MKDA does not support cu_seqlens-packed inputs.")
+        use_triton_mkda = self.num_keys <= 4 and hidden_states.is_cuda
 
         indices = None
         if attention_mask is not None:
-            indices, _, _ = get_unpad_data(attention_mask[:, -q_len:])
+            if not use_triton_mkda:
+                raise ValueError("attention_mask/padded batches require num_keys<=4 CUDA (Triton MKDA path).")
+            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
+        elif cu_seqlens is not None and not use_triton_mkda:
+            raise ValueError("cu_seqlens-packed inputs require num_keys<=4 CUDA (Triton MKDA path).")
 
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             if last_state is not None:
                 conv_state_q, conv_state_k, conv_state_v = last_state["conv_state"]
-            q, conv_state_q = self.q_conv1d(x=self.q_proj(hidden_states), cache=conv_state_q, output_final_state=use_cache)
-            k, conv_state_k = self.k_conv1d(x=self.k_proj(hidden_states), cache=conv_state_k, output_final_state=use_cache)
-            v, conv_state_v = self.v_conv1d(x=self.v_proj(hidden_states), cache=conv_state_v, output_final_state=use_cache)
+            q, conv_state_q = self.q_conv1d(
+                x=self.q_proj(hidden_states),
+                cache=conv_state_q,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
+            k, conv_state_k = self.k_conv1d(
+                x=self.k_proj(hidden_states),
+                cache=conv_state_k,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
+            v, conv_state_v = self.v_conv1d(
+                x=self.v_proj(hidden_states),
+                cache=conv_state_v,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
         else:
             q = F.silu(self.q_proj(hidden_states))
             k = F.silu(self.k_proj(hidden_states))
@@ -214,17 +231,30 @@ class ChunkwiseMultiKeyDeltaAttention(nn.Module):
         log_alpha = fused_kda_gate(g=g_raw, A_log=self.A_log, dt_bias=self.dt_bias).to(torch.float32)
 
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None
-        o, recurrent_state = mkda_chunkwise_parallel(
-            q=q,
-            k=k,
-            v=v,
-            log_alpha=log_alpha,
-            beta=beta,
-            initial_state=recurrent_state,
-            scale=self.head_k_dim**-0.5,
-            chunk_size=self.chunk_size,
-            output_final_state=bool(use_cache),
-        )
+        if use_triton_mkda:
+            o, recurrent_state = chunk_kda_rank_n(
+                q=q,
+                k=k,
+                v=v,
+                log_alpha=log_alpha,
+                beta=beta,
+                initial_state=recurrent_state,
+                scale=self.head_k_dim**-0.5,
+                output_final_state=bool(use_cache),
+                cu_seqlens=cu_seqlens,
+            )
+        else:
+            o, recurrent_state = mkda_chunkwise_parallel(
+                q=q,
+                k=k,
+                v=v,
+                log_alpha=log_alpha,
+                beta=beta,
+                initial_state=recurrent_state,
+                scale=self.head_k_dim**-0.5,
+                chunk_size=self.chunk_size,
+                output_final_state=bool(use_cache),
+            )
 
         if past_key_values is not None:
             past_key_values.update(
@@ -241,4 +271,3 @@ class ChunkwiseMultiKeyDeltaAttention(nn.Module):
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_values
-
