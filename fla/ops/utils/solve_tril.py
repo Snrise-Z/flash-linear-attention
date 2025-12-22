@@ -525,6 +525,118 @@ def merge_16x16_to_128x128_inverse_kernel(
                 tl.store(p, ai_ij.to(p.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
 
 
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=[
+        triton.Config({'DOT_PRECISION': DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [4, 8]
+        for num_stages in [2, 3, 4, 5]
+        for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
+    ],
+    key=['H', 'BT', 'IS_VARLEN'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def merge_16x16_to_256x256_inverse_kernel(
+    A,
+    Ai,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    USE_TMA: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    if i_t * BT >= T:
+        return
+
+    o_i = tl.arange(0, 16)
+    m_A = o_i[:, None] > o_i[None, :]
+    m_I = o_i[:, None] == o_i[None, :]
+    A += (bos * H + i_h) * BT
+    Ai += (bos * H + i_h) * BT
+
+    if USE_TMA:
+        desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
+        desc_o = make_tensor_descriptor(Ai, [T, BT], [H * BT, 1], [16, 16])
+
+    # 1) Solve diagonal 16x16 blocks independently.
+    for blk in range(0, 16):
+        row_off = i_t * BT + blk * 16
+        col_off = blk * 16
+
+        if USE_TMA:
+            b_L = desc.load([row_off, col_off]).to(tl.float32)
+        else:
+            p_L = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (row_off, col_off), (16, 16), (1, 0))
+            b_L = tl.load(p_L, boundary_check=(0, 1)).to(tl.float32)
+
+        b_Ai = -tl.where(m_A, b_L, 0)
+        # Forward substitution within the 16x16 block.
+        for i in range(2, 16):
+            b_a = -b_L[i, :]
+            b_a = tl.where(o_i < i, b_a, 0.)
+            b_a += tl.sum(b_a[:, None] * b_Ai, 0)
+            b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
+        b_Ai += m_I
+
+        if USE_TMA:
+            desc_o.store([row_off, col_off], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+        else:
+            p_Ai = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (row_off, col_off), (16, 16), (1, 0))
+            tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+
+    # 2) Compute off-diagonal blocks with block forward substitution:
+    #    Ai_{i,j} = -Ai_{i,i} @ sum_{k=j..i-1} L_{i,k} @ Ai_{k,j}.
+    for i_blk in range(1, 16):
+        row_i = i_t * BT + i_blk * 16
+
+        if USE_TMA:
+            b_Ai_ii = desc_o.load([row_i, i_blk * 16]).to(tl.float32)
+        else:
+            p_Ai_ii = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (row_i, i_blk * 16), (16, 16), (1, 0))
+            b_Ai_ii = tl.load(p_Ai_ii, boundary_check=(0, 1)).to(tl.float32)
+
+        for j_blk in range(0, i_blk):
+            col_j = j_blk * 16
+            acc = tl.zeros([16, 16], dtype=tl.float32)
+            for k_blk in range(j_blk, i_blk):
+                col_k = k_blk * 16
+                row_k = i_t * BT + k_blk * 16
+
+                if USE_TMA:
+                    b_Lik = desc.load([row_i, col_k]).to(tl.float32)
+                    b_Aikj = desc_o.load([row_k, col_j]).to(tl.float32)
+                else:
+                    p_Lik = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (row_i, col_k), (16, 16), (1, 0))
+                    p_Aikj = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (row_k, col_j), (16, 16), (1, 0))
+                    b_Lik = tl.load(p_Lik, boundary_check=(0, 1)).to(tl.float32)
+                    b_Aikj = tl.load(p_Aikj, boundary_check=(0, 1)).to(tl.float32)
+
+                acc += tl.dot(b_Lik, b_Aikj, input_precision=DOT_PRECISION)
+
+            b_Ai_ij = -tl.dot(b_Ai_ii, acc, input_precision=DOT_PRECISION)
+
+            if USE_TMA:
+                desc_o.store([row_i, col_j], b_Ai_ij.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+            else:
+                p_Ai_ij = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (row_i, col_j), (16, 16), (1, 0))
+                tl.store(p_Ai_ij, b_Ai_ij.to(p_Ai_ij.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+
+
 @input_guard
 def solve_tril(
     A: torch.Tensor,
@@ -538,7 +650,7 @@ def solve_tril(
 
     Args:
         A (torch.Tensor):
-            [B, T, H, BT], where BT should only be 16, 32, 64, or 128.
+            [B, T, H, BT], where BT should only be 16, 32, 64, 128, or 256.
         cu_seqlens (torch.Tensor):
             The cumulative sequence lengths of the input tensor. Default: `None`.
         output_dtype (torch.dtype):
@@ -548,7 +660,7 @@ def solve_tril(
     Returns:
         (I + A)^-1 with the same shape as A
     """
-    assert A.shape[-1] in [16, 32, 64, 128]
+    assert A.shape[-1] in [16, 32, 64, 128, 256]
     output_dtype = A.dtype if output_dtype is None else output_dtype
 
     B, T, H, BT = A.shape
@@ -565,6 +677,8 @@ def solve_tril(
         merge_fn = merge_16x16_to_64x64_inverse_kernel
     elif BT == 128:
         merge_fn = merge_16x16_to_128x128_inverse_kernel
+    elif BT == 256:
+        merge_fn = merge_16x16_to_256x256_inverse_kernel
 
     merge_fn[NT, B * H](
         A=A,
