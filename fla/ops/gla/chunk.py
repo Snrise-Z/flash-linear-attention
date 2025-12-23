@@ -379,6 +379,115 @@ def chunk_gla_fwd_kernel_o(
 })
 @triton.autotune(
     configs=[
+        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in BK_LIST
+        for BV in BV_LIST
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['BT'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def chunk_gla_fwd_kernel_o_tiled(
+    q,
+    v,
+    g,
+    h,
+    o,
+    A,
+    cu_seqlens,
+    chunk_indices,
+    scale,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    BM: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """
+    Tiled version of `chunk_gla_fwd_kernel_o` for BT>128 (e.g. BT=256).
+
+    Computes o = qg@h + A@v for a (chunk, head) in row blocks.
+    Grid: (NT, B*H, NM*NV), where NM=BT/BM and NV=ceil(V/BV).
+    """
+    i_t, i_bh, i_tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    if IS_VARLEN:
+        i_tg = i_t
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+        i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        NT = tl.cdiv(T, BT)
+        i_tg = i_b * NT + i_t
+        bos, eos = i_b * T, i_b * T + T
+
+    if i_t * BT >= T:
+        return
+
+    NV: tl.constexpr = tl.cdiv(V, BV)
+    i_m = i_tile // NV
+    i_v = i_tile - i_m * NV
+
+    row_start = i_t * BT + i_m * BM
+    row_off = i_m * BM
+    col_v = i_v * BV
+
+    q += (bos * H + i_h) * K
+    v += (bos * H + i_h) * V
+    g += (bos * H + i_h) * K
+    o += (bos * H + i_h) * V
+    A += (bos * H + i_h) * BT
+    h += (i_tg * H + i_h) * K * V
+
+    # 1) Inter-chunk term: qg @ h
+    b_o = tl.zeros([BM, BV], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (row_start, i_k * BK), (BM, BK), (1, 0))
+        p_g = tl.make_block_ptr(g, (T, K), (H * K, 1), (row_start, i_k * BK), (BM, BK), (1, 0))
+        p_h = tl.make_block_ptr(h, (K, V), (V, 1), (i_k * BK, col_v), (BK, BV), (1, 0))
+
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_q = (b_q * scale).to(b_q.dtype)
+        b_g = tl.load(p_g, boundary_check=(0, 1))
+        if USE_EXP2:
+            b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+        else:
+            b_qg = (b_q * exp(b_g)).to(b_q.dtype)
+        b_h = tl.load(p_h, boundary_check=(0, 1))
+        b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
+
+    # 2) Intra-chunk term: A @ v, only causal blocks (col_blk <= row_blk).
+    NB: tl.constexpr = BT // BM
+    for j_blk in range(0, NB):
+        if j_blk <= i_m:
+            col_start = j_blk * BM
+            p_A = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (row_start, col_start), (BM, BM), (1, 0))
+            b_A = tl.load(p_A, boundary_check=(0, 1))
+            if j_blk == i_m:
+                m_lo = tl.arange(0, BM)[:, None] >= tl.arange(0, BM)[None, :]
+                b_A = tl.where(m_lo, b_A, 0.0)
+            p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_t * BT + col_start, col_v), (BM, BV), (1, 0))
+            b_v = tl.load(p_v, boundary_check=(0, 1))
+            b_o += tl.dot(b_A.to(b_v.dtype), b_v)
+
+    p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (row_start, col_v), (BM, BV), (1, 0))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4]
@@ -874,8 +983,33 @@ def chunk_gla_fwd_o_gk(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     o = torch.empty_like(v)
-    def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * H)
-    chunk_gla_fwd_kernel_o[grid](
+    if BT <= 128:
+        def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * H)
+        chunk_gla_fwd_kernel_o[grid](
+            q=q,
+            v=v,
+            g=g,
+            h=h,
+            o=o,
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            T=T,
+            H=H,
+            K=K,
+            V=V,
+            BT=BT,
+            USE_EXP2=use_exp2,
+        )
+        return o
+
+    BM = 32
+    if BT % BM != 0:
+        raise ValueError(f"chunk_gla_fwd_o_gk requires chunk_size divisible by {BM} when BT>128, got BT={BT}.")
+
+    def grid(meta): return (NT, B * H, (BT // BM) * triton.cdiv(V, meta['BV']))
+    chunk_gla_fwd_kernel_o_tiled[grid](
         q=q,
         v=v,
         g=g,
@@ -890,6 +1024,7 @@ def chunk_gla_fwd_o_gk(
         K=K,
         V=V,
         BT=BT,
+        BM=BM,
         USE_EXP2=use_exp2,
     )
     return o

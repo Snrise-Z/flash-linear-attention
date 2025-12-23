@@ -388,6 +388,8 @@ class ChunkKDARankNFunction(torch.autograd.Function):
             beta=beta_flat,
             gk=g_flat,
             A=Akk,
+            w=w,
+            u=u,
             dk=dk,
             dw=dw,
             du=dv,

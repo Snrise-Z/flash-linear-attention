@@ -96,6 +96,162 @@ def chunk_bwd_kernel_dAv(
 })
 @triton.autotune(
     configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in NUM_WARPS
+        for num_stages in [2, 3, 4]
+    ],
+    key=['H', 'V', 'BT', 'BV'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def chunk_bwd_kernel_dv_tiled(
+    A,
+    do,
+    dv,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    BM: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """
+    Tiled dv = A^T @ do for BT>128 (e.g. BT=256), where A is stored in [T,BT] and only
+    the causal (lower-tri) region is valid.
+
+    Grid: (NT, B*H, NM*NV), where NM=BT/BM and NV=ceil(V/BV).
+    """
+    i_t, i_bh, i_tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+        i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos = i_b * T
+
+    if i_t * BT >= T:
+        return
+
+    NV: tl.constexpr = tl.cdiv(V, BV)
+    i_m = i_tile // NV
+    i_v = i_tile - i_m * NV
+
+    row_start = i_t * BT + i_m * BM
+    row_off = i_m * BM
+    col_v = i_v * BV
+
+    base_A = A + (bos * H + i_h) * BT
+    base_do = do + (bos * H + i_h) * V
+    base_dv = dv + (bos * H + i_h) * V
+
+    acc = tl.zeros([BM, BV], dtype=tl.float32)
+    for i_inner in range(0, BT, BM):
+        # Skip blocks strictly below diagonal of A^T (where i < j => A_{i,j}=0).
+        if i_inner >= row_off:
+            p_AT = tl.make_block_ptr(base_A, (BT, T), (1, H * BT), (row_off, i_t * BT + i_inner), (BM, BM), (0, 1))
+            b_AT = tl.load(p_AT, boundary_check=(0, 1))
+            if i_inner == row_off:
+                m_up = tl.arange(0, BM)[:, None] <= tl.arange(0, BM)[None, :]
+                b_AT = tl.where(m_up, b_AT, 0.0)
+
+            p_do = tl.make_block_ptr(base_do, (T, V), (H * V, 1), (i_t * BT + i_inner, col_v), (BM, BV), (1, 0))
+            b_do = tl.load(p_do, boundary_check=(0, 1))
+            acc += tl.dot(b_AT.to(b_do.dtype), b_do)
+
+    p_dv = tl.make_block_ptr(base_dv, (T, V), (H * V, 1), (row_start, col_v), (BM, BV), (1, 0))
+    tl.store(p_dv, acc.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in NUM_WARPS
+        for num_stages in [2, 3, 4]
+    ],
+    key=['H', 'V', 'BT', 'BV'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def chunk_bwd_kernel_dA_tiled(
+    v,
+    do,
+    dA,
+    cu_seqlens,
+    chunk_indices,
+    scale,
+    T,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    BM: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """
+    Tiled dA = do @ v^T (causal lower-tri, inclusive diag) for BT>128 (e.g. BT=256).
+
+    Grid: (NT, B*H, NB*NB) with NB=BT/BM; skips blocks with j>i.
+    """
+    i_t, i_bh, i_blk_pair = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+        i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos = i_b * T
+
+    if i_t * BT >= T:
+        return
+
+    NB: tl.constexpr = BT // BM
+    i_blk = i_blk_pair // NB
+    j_blk = i_blk_pair - i_blk * NB
+    if j_blk > i_blk:
+        return
+
+    row_start = i_t * BT + i_blk * BM
+    col_start = j_blk * BM
+
+    base_v = v + (bos * H + i_h) * V
+    base_do = do + (bos * H + i_h) * V
+    base_dA = dA + (bos * H + i_h) * BT
+
+    b_dA = tl.zeros([BM, BM], dtype=tl.float32)
+    for i_v in range(tl.cdiv(V, BV)):
+        col_v = i_v * BV
+        p_do = tl.make_block_ptr(base_do, (T, V), (H * V, 1), (row_start, col_v), (BM, BV), (1, 0))
+        p_v = tl.make_block_ptr(base_v, (T, V), (H * V, 1), (i_t * BT + col_start, col_v), (BM, BV), (1, 0))
+        b_do = tl.load(p_do, boundary_check=(0, 1))
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_dA += tl.dot(b_do, tl.trans(b_v))
+
+    if i_blk == j_blk:
+        m_lo = tl.arange(0, BM)[:, None] >= tl.arange(0, BM)[None, :]
+        b_dA = tl.where(m_lo, b_dA * scale, 0.0)
+    else:
+        b_dA *= scale
+
+    p_dA = tl.make_block_ptr(base_dA, (T, BT), (H * BT, 1), (row_start, col_start), (BM, BM), (1, 0))
+    tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=[
         triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for BK in BK_LIST
         for BV in BV_LIST
@@ -242,27 +398,68 @@ def chunk_kda_bwd_dAv(
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    dA = v.new_empty(B, T, H, BT, dtype=torch.float)
     dv = torch.empty_like(do)
-    grid = (NT, B * H)
-    chunk_bwd_kernel_dAv[grid](
-        q=q,
-        k=k,
-        v=v,
+    if BT <= 128:
+        dA = v.new_empty(B, T, H, BT, dtype=torch.float)
+        grid = (NT, B * H)
+        chunk_bwd_kernel_dAv[grid](
+            q=q,
+            k=k,
+            v=v,
+            A=A,
+            do=do,
+            dv=dv,
+            dA=dA,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            T=T,
+            H=H,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+        )
+        return dA, dv
+
+    # BT>128: use tiled kernels to avoid BT×BT materialization.
+    BM = 32
+    if BT % BM != 0:
+        raise ValueError(f"chunk_kda_bwd_dAv requires BT divisible by {BM} when BT>128, got BT={BT}.")
+
+    # dA must be zero-initialized: tiled kernel only writes lower blocks.
+    dA = v.new_zeros(B, T, H, BT, dtype=torch.float)
+
+    grid_dv = (NT, B * H, (BT // BM) * triton.cdiv(V, BV))
+    chunk_bwd_kernel_dv_tiled[grid_dv](
         A=A,
         do=do,
         dv=dv,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        V=V,
+        BT=BT,
+        BV=BV,
+        BM=BM,
+    )
+
+    grid_dA = (NT, B * H, (BT // BM) * (BT // BM))
+    chunk_bwd_kernel_dA_tiled[grid_dA](
+        v=v,
+        do=do,
         dA=dA,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
         T=T,
         H=H,
-        K=K,
         V=V,
         BT=BT,
-        BK=BK,
         BV=BV,
+        BM=BM,
     )
     return dA, dv
 

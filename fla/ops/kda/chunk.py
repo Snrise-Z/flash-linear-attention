@@ -154,6 +154,8 @@ def chunk_kda_bwd(
         beta=beta,
         gk=g,
         A=Akk,
+        w=w,
+        u=u,
         dk=dk,
         dw=dw,
         du=dv,

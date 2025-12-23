@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.utils import prepare_chunk_indices
+from fla.ops.utils import prepare_chunk_indices, solve_tril
 from fla.ops.utils.op import exp2
 from fla.utils import IS_TF32_SUPPORTED, autotune_cache_kwargs
 
@@ -381,6 +381,137 @@ def chunk_kda_rank2_fwd_kernel_inter_solve_fused(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps)
         for BK in [32, 64]
+        for num_warps in [1, 2, 4, 8]
+    ],
+    key=["H", "K", "BT"],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=["T"])
+def chunk_kda_rank2_fwd_kernel_build_L(
+    k,
+    g,
+    beta,
+    L,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    NB: tl.constexpr,
+    BK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """
+    Build the strictly-lower pseudo-time L matrix (within-token couplings masked) for rank-2 pseudo-time.
+
+    Within-token masking: L[i, j] = 0 when floor(i/2) == floor(j/2), which is equivalent to j < (i//2)*2.
+    """
+    i_t, i_blk_pair, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    if IS_VARLEN:
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+        i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos = i_b * T
+
+    if i_t * BT >= T:
+        return
+
+    i_blk = i_blk_pair // NB
+    j_blk = i_blk_pair - i_blk * NB
+    if j_blk > i_blk:
+        return
+
+    row_start = i_t * BT + i_blk * BC
+    col_start = j_blk * BC
+
+    b_L = tl.zeros([BC, BC], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        k_off = i_k * BK
+        o_k = k_off + tl.arange(0, BK)
+        m_k = o_k < K
+
+        p_k_row = tl.make_block_ptr(
+            k + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (row_start, k_off),
+            (BC, BK),
+            (1, 0),
+        )
+        p_g_row = tl.make_block_ptr(
+            g + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (row_start, k_off),
+            (BC, BK),
+            (1, 0),
+        )
+        p_k_col = tl.make_block_ptr(
+            k + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + col_start, k_off),
+            (BC, BK),
+            (1, 0),
+        )
+        p_g_col = tl.make_block_ptr(
+            g + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + col_start, k_off),
+            (BC, BK),
+            (1, 0),
+        )
+
+        b_k_row = tl.load(p_k_row, boundary_check=(0, 1)).to(tl.float32)
+        b_g_row = tl.load(p_g_row, boundary_check=(0, 1)).to(tl.float32)
+        b_k_col = tl.load(p_k_col, boundary_check=(0, 1)).to(tl.float32)
+        b_g_col = tl.load(p_g_col, boundary_check=(0, 1)).to(tl.float32)
+
+        g_base = g + (bos * H + i_h) * K
+        g_n = tl.load(g_base + row_start * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+        row_scale = exp2(b_g_row - g_n[None, :])
+        col_scale = exp2(g_n[None, :] - b_g_col)
+        b_L += tl.dot(b_k_row * row_scale, tl.trans(b_k_col * col_scale))
+
+    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (row_start,), (BC,), (0,))
+    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+    b_L *= b_beta[:, None]
+
+    if i_blk == j_blk:
+        row_ids = row_start + tl.arange(0, BC)
+        col_ids = i_t * BT + col_start + tl.arange(0, BC)
+        token_start = row_ids - (row_ids % 2)
+        m_keep = col_ids[None, :] < token_start[:, None]
+        b_L = tl.where(m_keep, b_L, 0.0)
+
+    p_L = tl.make_block_ptr(
+        L + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (row_start, col_start),
+        (BC, BC),
+        (1, 0),
+    )
+    tl.store(p_L, b_L.to(p_L.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": BK}, num_warps=num_warps)
+        for BK in [32, 64]
         for num_warps in [1, 2, 4]
     ],
     key=["H", "K", "BC"],
@@ -596,9 +727,9 @@ def chunk_kda_rank2_fwd_intra_a_inv(
     B, T, H, K = k.shape
     BT = int(chunk_size)
     BC = 32
-    if BT not in (64, 128):
+    if BT not in (64, 128, 256):
         raise ValueError(
-            f"chunk_kda_rank2_fwd_intra_a_inv currently supports chunk_size in {{64,128}}, got {chunk_size}.",
+            f"chunk_kda_rank2_fwd_intra_a_inv currently supports chunk_size in {{64,128,256}}, got {chunk_size}.",
         )
 
     if cu_seqlens is not None:
@@ -612,60 +743,84 @@ def chunk_kda_rank2_fwd_intra_a_inv(
         NT = triton.cdiv(T, BT)
         N = B
 
-    # Diagonal blocks buffer (fp32). Only strictly-lower entries are used.
-    Akkd = torch.empty((B, T, H, BC), device=k.device, dtype=torch.float32)
-    # Output inverse (dtype like k). Must be zero-initialized (kernel writes only lower blocks).
-    Akk = torch.zeros((B, T, H, BT), device=k.device, dtype=k.dtype)
+    if BT in (64, 128):
+        # Diagonal blocks buffer (fp32). Only strictly-lower entries are used.
+        Akkd = torch.empty((B, T, H, BC), device=k.device, dtype=torch.float32)
+        # Output inverse (dtype like k). Must be zero-initialized (kernel writes only lower blocks).
+        Akk = torch.zeros((B, T, H, BT), device=k.device, dtype=k.dtype)
 
-    def grid_diag(meta):
-        return (B * T, triton.cdiv(H, meta["BH"]))
+        def grid_diag(meta):
+            return (B * T, triton.cdiv(H, meta["BH"]))
 
-    chunk_kda_rank2_fwd_kernel_intra_token_parallel[grid_diag](
+        chunk_kda_rank2_fwd_kernel_intra_token_parallel[grid_diag](
+            k=k,
+            g=gk,
+            beta=beta,
+            Akkd=Akkd,
+            cu_seqlens=cu_seqlens,
+            N=N,
+            T=T,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=BC,
+        )
+
+        grid = (NT, B * H)
+        if BT == 64:
+            chunk_kda_rank2_fwd_kernel_inter_solve_fused_bt64[grid](
+                k=k,
+                g=gk,
+                beta=beta,
+                Akkd=Akkd,
+                Akk=Akk,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                T=T,
+                H=H,
+                K=K,
+                BT=BT,
+                BC=BC,
+            )
+        else:
+            chunk_kda_rank2_fwd_kernel_inter_solve_fused[grid](
+                k=k,
+                g=gk,
+                beta=beta,
+                Akkd=Akkd,
+                Akk=Akk,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                T=T,
+                H=H,
+                K=K,
+                BT=BT,
+                BC=BC,
+            )
+        return Akk
+
+    # BT=256: build L in float32 blocks then solve (I+L)^-1 via solve_tril (supports BT=256).
+    NB = BT // BC
+    if NB * BC != BT:
+        raise ValueError(f"Expected chunk_size BT divisible by BC={BC}, got BT={BT}.")
+
+    L = torch.empty((B, T, H, BT), device=k.device, dtype=torch.float32)
+    grid_L = (NT, NB * NB, B * H)
+    chunk_kda_rank2_fwd_kernel_build_L[grid_L](
         k=k,
         g=gk,
         beta=beta,
-        Akkd=Akkd,
+        L=L,
         cu_seqlens=cu_seqlens,
-        N=N,
+        chunk_indices=chunk_indices,
         T=T,
         H=H,
         K=K,
         BT=BT,
         BC=BC,
+        NB=NB,
     )
-
-    grid = (NT, B * H)
-    if BT == 64:
-        chunk_kda_rank2_fwd_kernel_inter_solve_fused_bt64[grid](
-            k=k,
-            g=gk,
-            beta=beta,
-            Akkd=Akkd,
-            Akk=Akk,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            T=T,
-            H=H,
-            K=K,
-            BT=BT,
-            BC=BC,
-        )
-    else:
-        chunk_kda_rank2_fwd_kernel_inter_solve_fused[grid](
-            k=k,
-            g=gk,
-            beta=beta,
-            Akkd=Akkd,
-            Akk=Akk,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            T=T,
-            H=H,
-            K=K,
-            BT=BT,
-            BC=BC,
-        )
-    return Akk
+    return solve_tril(A=L, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, output_dtype=k.dtype)
 
 
 def chunk_kda_rank2_bwd_mask_dAkk_within_token(
@@ -680,10 +835,10 @@ def chunk_kda_rank2_bwd_mask_dAkk_within_token(
     Zeroes the within-token coupling entry (i odd, j=i-1) for each sequence.
     """
     B, T, H, BT = dAkk.shape
-    if int(chunk_size) != BT or BT not in (64, 128):
+    if int(chunk_size) != BT or BT not in (64, 128, 256):
         raise ValueError(
             "chunk_kda_rank2_bwd_mask_dAkk_within_token requires chunk_size == dAkk.shape[-1] and "
-            f"BT in {{64,128}}, got {chunk_size=} {BT=}.",
+            f"BT in {{64,128,256}}, got {chunk_size=} {BT=}.",
         )
     if cu_seqlens is not None and B != 1:
         raise ValueError("When cu_seqlens is provided, expected batch size B==1 for packed inputs.")

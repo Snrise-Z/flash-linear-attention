@@ -4,9 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.ops.gla.chunk import chunk_gla_fwd_intra_gk
 from fla.ops.kda.chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
 from fla.ops.kda.wy_fast import recompute_w_u_fwd
-from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
+from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices, solve_tril
+from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.op import exp2
 from fla.utils import IS_TF32_SUPPORTED, autotune_cache_kwargs
 
@@ -343,6 +345,141 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     tl.store(p_Akk33, b_Ai33.to(Akk.dtype.element_ty), boundary_check=(0, 1))
 
 
+################################################################################
+# BT=256 path: build strictly-lower L in blocks, then solve_tril(I+L)
+################################################################################
+
+
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": BK}, num_warps=num_warps)
+        for BK in [32, 64]
+        for num_warps in [1, 2, 4, 8]
+    ],
+    key=["H", "K", "BT"],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=["T"])
+def chunk_kda_fwd_kernel_build_L(
+    k,
+    g,
+    beta,
+    L,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    NB: tl.constexpr,
+    BK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """
+    Build the strictly-lower L matrix for one (chunk, head) as BCxBC blocks into `L` with shape [B,T,H,BT].
+    Used for BT=256 to avoid materializing large BC=BT/4 blocks in registers.
+    """
+    i_t, i_blk_pair, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    if IS_VARLEN:
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+        i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos = i_b * T
+
+    if i_t * BT >= T:
+        return
+
+    i_blk = i_blk_pair // NB
+    j_blk = i_blk_pair - i_blk * NB
+    if j_blk > i_blk:
+        return
+
+    row_start = i_t * BT + i_blk * BC
+    col_start = j_blk * BC
+
+    # Row-block reference g_n at row_start (per feature dim) for numerical stability.
+    g_base = g + (bos * H + i_h) * K
+
+    b_L = tl.zeros([BC, BC], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        k_off = i_k * BK
+        o_k = k_off + tl.arange(0, BK)
+        m_k = o_k < K
+
+        p_k_row = tl.make_block_ptr(
+            k + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (row_start, k_off),
+            (BC, BK),
+            (1, 0),
+        )
+        p_g_row = tl.make_block_ptr(
+            g + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (row_start, k_off),
+            (BC, BK),
+            (1, 0),
+        )
+        p_k_col = tl.make_block_ptr(
+            k + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + col_start, k_off),
+            (BC, BK),
+            (1, 0),
+        )
+        p_g_col = tl.make_block_ptr(
+            g + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + col_start, k_off),
+            (BC, BK),
+            (1, 0),
+        )
+
+        b_k_row = tl.load(p_k_row, boundary_check=(0, 1)).to(tl.float32)
+        b_g_row = tl.load(p_g_row, boundary_check=(0, 1)).to(tl.float32)
+        b_k_col = tl.load(p_k_col, boundary_check=(0, 1)).to(tl.float32)
+        b_g_col = tl.load(p_g_col, boundary_check=(0, 1)).to(tl.float32)
+
+        g_n = tl.load(g_base + row_start * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+        row_scale = exp2(b_g_row - g_n[None, :])
+        col_scale = exp2(g_n[None, :] - b_g_col)
+        b_L += tl.dot(b_k_row * row_scale, tl.trans(b_k_col * col_scale))
+
+    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (row_start,), (BC,), (0,))
+    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+    b_L *= b_beta[:, None]
+
+    if i_blk == j_blk:
+        row_ids = row_start + tl.arange(0, BC)
+        col_ids = i_t * BT + col_start + tl.arange(0, BC)
+        b_L = tl.where(col_ids[None, :] < row_ids[:, None], b_L, 0.0)
+
+    p_L = tl.make_block_ptr(
+        L + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (row_start, col_start),
+        (BC, BC),
+        (1, 0),
+    )
+    tl.store(p_L, b_L.to(p_L.dtype.element_ty), boundary_check=(0, 1))
+
+
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -569,51 +706,96 @@ def chunk_kda_fwd_intra(
 ):
     B, T, H, K = k.shape
     BT = chunk_size
-    if BT not in (64, 128):
-        raise ValueError(f"chunk_kda_fwd_intra currently supports chunk_size in {{64,128}}, got {chunk_size}.")
-    BC = BT // 4
+    if BT not in (64, 128, 256):
+        raise ValueError(
+            f"chunk_kda_fwd_intra currently supports chunk_size in {{64,128,256}}, got {chunk_size}."
+        )
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
-    # Akk must be zero-initialized - kernel only writes lower triangular
-    Akk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
-    # Separate fp32 buffer for diagonal 16x16 blocks (for precision in solve_tril)
-    Akkd = torch.empty(B, T, H, BC, device=k.device, dtype=torch.float32)
+    if BT in (64, 128):
+        BC = BT // 4
+        Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+        # Akk must be zero-initialized - kernel only writes lower triangular
+        Akk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
+        # Separate fp32 buffer for diagonal BCxBC blocks (for precision in solve_tril)
+        Akkd = torch.empty(B, T, H, BC, device=k.device, dtype=torch.float32)
 
-    # Step 1: Run token_parallel first to compute diagonal blocks into Akkd (fp32)
-    Aqk, Akkd = chunk_kda_fwd_intra_token_parallel(
-        q=q,
-        k=k,
-        gk=gk,
-        beta=beta,
-        Aqk=Aqk,
-        Akk=Akkd,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=BT,
-        sub_chunk_size=BC,
-    )
-    # Step 2: Fused inter + solve_tril (works for both fixed-len and varlen)
-    grid = (NT, B * H)
-    chunk_kda_fwd_kernel_inter_solve_fused[grid](
-        q=q,
-        k=k,
-        g=gk,
-        beta=beta,
-        Aqk=Aqk,
-        Akkd=Akkd,
-        Akk=Akk,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        K=K,
-        BT=BT,
-        BC=BC,
-    )
+        # Step 1: Run token_parallel first to compute diagonal blocks into Akkd (fp32)
+        Aqk, Akkd = chunk_kda_fwd_intra_token_parallel(
+            q=q,
+            k=k,
+            gk=gk,
+            beta=beta,
+            Aqk=Aqk,
+            Akk=Akkd,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=BT,
+            sub_chunk_size=BC,
+        )
+        # Step 2: Fused inter + solve_tril (works for both fixed-len and varlen)
+        grid = (NT, B * H)
+        chunk_kda_fwd_kernel_inter_solve_fused[grid](
+            q=q,
+            k=k,
+            g=gk,
+            beta=beta,
+            Aqk=Aqk,
+            Akkd=Akkd,
+            Akk=Akk,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=BC,
+        )
+    else:
+        if gk is None:
+            raise ValueError("chunk_kda_fwd_intra requires `gk` when chunk_size=256.")
+        if beta is None:
+            raise ValueError("chunk_kda_fwd_intra requires `beta` when chunk_size=256.")
+        if scale is None:
+            raise ValueError("chunk_kda_fwd_intra requires `scale` when chunk_size=256.")
+
+        # BT=256: compute Aqk via GLA intra kernel in ln-space (exp), and Akk via solve_tril on
+        # a float32 strictly-lower L (in log2-space, exp2).
+        g_ln = gk.to(torch.float32) / float(RCP_LN2)
+        Aqk = chunk_gla_fwd_intra_gk(
+            q=q,
+            k=k,
+            g=g_ln,
+            scale=float(scale),
+            cu_seqlens=cu_seqlens,
+            chunk_size=BT,
+        ).to(k.dtype)
+
+        BC = 32
+        NB = BT // BC
+        if NB * BC != BT:
+            raise ValueError(f"Expected chunk_size BT divisible by BC={BC}, got BT={BT}.")
+
+        L = torch.empty((B, T, H, BT), device=k.device, dtype=torch.float32)
+        grid_L = (NT, NB * NB, B * H)
+        chunk_kda_fwd_kernel_build_L[grid_L](
+            k=k,
+            g=gk,
+            beta=beta,
+            L=L,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=BC,
+            NB=NB,
+        )
+        Akk = solve_tril(A=L, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, output_dtype=k.dtype)
     w, u, _, kg = recompute_w_u_fwd(
         k=k,
         v=v,

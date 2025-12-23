@@ -242,6 +242,7 @@ class ChunkwiseMultiKeyDeltaAttention(nn.Module):
                 scale=self.head_k_dim**-0.5,
                 output_final_state=bool(use_cache),
                 cu_seqlens=cu_seqlens,
+                chunk_size=self.chunk_size,
             )
         else:
             o, recurrent_state = mkda_chunkwise_parallel(
