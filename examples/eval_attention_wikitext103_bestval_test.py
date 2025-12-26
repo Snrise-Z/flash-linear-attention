@@ -1,4 +1,8 @@
 #!/usr/bin/env python
+"""
+Evaluate standard Transformer (Attention) on WikiText-103 using best validation checkpoint.
+Adapted from eval_kda_wikitext103_bestval_test.py
+"""
 from __future__ import annotations
 
 import argparse
@@ -13,12 +17,12 @@ from datasets import DatasetDict, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, DefaultDataCollator
 
-import fla  # noqa: F401  (registers FLA models/configs with HF auto classes)
+import fla  # noqa: F401
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Evaluate KDA on WikiText-103 using the run's best validation checkpoint (trainer_state.json)."
+        description="Evaluate standard Transformer on WikiText-103 using run's best validation checkpoint"
     )
     p.add_argument("--run_dir", type=str, required=True, help="Training output dir (contains trainer_state.json).")
     p.add_argument("--tokenizer", type=str, default=None, help="Tokenizer name/path (default: use --run_dir).")
@@ -27,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_config", type=str, default="wikitext-103-raw-v1")
     p.add_argument("--text_column", type=str, default="text")
     p.add_argument("--cache_dir", type=str, default=None)
-    p.add_argument("--tokenized_cache", type=str, default="./data/wikitext103_gpt2_1024", help="If set, save/load tokenized dataset here.")
+    p.add_argument("--tokenized_cache", type=str, default="./data/wikitext103_gpt2_1024")
 
     p.add_argument("--seq_len", type=int, default=1024)
     p.add_argument("--num_proc", type=int, default=8)
@@ -189,14 +193,13 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
 
-    print(f"[kda] best_model_checkpoint={ckpt}", flush=True)
+    print(f"[attention] best_model_checkpoint={ckpt}", flush=True)
     if "validation" in out:
-        print(f"[kda] val:  loss={out['validation']['loss']:.6f} ppl={out['validation']['perplexity']:.3f}", flush=True)
+        print(f"[attention] val:  loss={out['validation']['loss']:.6f} ppl={out['validation']['perplexity']:.3f}", flush=True)
     if "test" in out:
-        print(f"[kda] test: loss={out['test']['loss']:.6f} ppl={out['test']['perplexity']:.3f}", flush=True)
-    print(f"[kda] wrote {out_path}", flush=True)
+        print(f"[attention] test: loss={out['test']['loss']:.6f} ppl={out['test']['perplexity']:.3f}", flush=True)
+    print(f"[attention] wrote {out_path}", flush=True)
 
 
 if __name__ == "__main__":
     main()
-

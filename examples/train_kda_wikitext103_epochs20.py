@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_config", type=str, default="wikitext-103-raw-v1", help="HF datasets config.")
     p.add_argument("--text_column", type=str, default="text")
     p.add_argument("--cache_dir", type=str, default=None, help="HF datasets cache_dir.")
-    p.add_argument("--tokenized_cache", type=str, default=None, help="If set, save/load tokenized dataset here.")
+    p.add_argument("--tokenized_cache", type=str, default="./data/wikitext103_gpt2_1024", help="If set, save/load tokenized dataset here.")
 
     p.add_argument("--seq_len", type=int, default=1024)
     p.add_argument("--num_proc", type=int, default=8)
@@ -55,19 +55,19 @@ def parse_args() -> argparse.Namespace:
 
     # Training budget
     p.add_argument("--max_epochs", type=int, default=20)
-    p.add_argument("--per_device_train_batch_size", type=int, default=1)
-    p.add_argument("--per_device_eval_batch_size", type=int, default=1)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    p.add_argument("--learning_rate", type=float, default=3e-4)
+    p.add_argument("--per_device_train_batch_size", type=int, default=32)
+    p.add_argument("--per_device_eval_batch_size", type=int, default=64)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=2)
+    p.add_argument("--learning_rate", type=float, default=6e-4)
     p.add_argument("--weight_decay", type=float, default=0.1)
-    p.add_argument("--warmup_ratio", type=float, default=0.01)
-    p.add_argument("--logging_steps", type=int, default=10)
+    p.add_argument("--warmup_ratio", type=float, default=0.02)
+    p.add_argument("--logging_steps", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
 
     p.add_argument("--fp16", action="store_true", default=None)
-    p.add_argument("--bf16", action="store_true", default=None)
-    p.add_argument("--dataloader_num_workers", type=int, default=0)
-    p.add_argument("--preflight_compile", action="store_true", default=False)
+    p.add_argument("--bf16", action="store_true", default=True)
+    p.add_argument("--dataloader_num_workers", type=int, default=4)
+    p.add_argument("--preflight_compile", action="store_true", default=True)
 
     return p.parse_args()
 
@@ -267,6 +267,11 @@ def main() -> None:
         report_to="none",
         dataloader_num_workers=args.dataloader_num_workers,
         remove_unused_columns=False,
+        optim="adamw_torch_fused",
+        adam_beta1=0.9,
+        adam_beta2=0.95,
+        adam_epsilon=1e-8,
+        max_grad_norm=1.0,
     )
 
     trainer = Trainer(

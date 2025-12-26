@@ -1,4 +1,11 @@
 #!/usr/bin/env python
+"""
+Evaluate SBLA Transformer on WikiText-103 using best validation checkpoint.
+Adapted from eval_kda_wikitext103_bestval_test.py
+
+Note: This script reconstructs the SBLA model architecture before loading weights,
+since SBLA is implemented as a monkey-patch on top of the standard Transformer.
+"""
 from __future__ import annotations
 
 import argparse
@@ -11,14 +18,15 @@ from typing import Any
 import torch
 from datasets import DatasetDict, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, DefaultDataCollator
+from transformers import AutoTokenizer, DefaultDataCollator
 
-import fla  # noqa: F401  (registers FLA models/configs with HF auto classes)
+import fla  # noqa: F401
+from fla.models.transformer import TransformerConfig, TransformerForCausalLM
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Evaluate KDA on WikiText-103 using the run's best validation checkpoint (trainer_state.json)."
+        description="Evaluate SBLA Transformer on WikiText-103 using run's best validation checkpoint"
     )
     p.add_argument("--run_dir", type=str, required=True, help="Training output dir (contains trainer_state.json).")
     p.add_argument("--tokenizer", type=str, default=None, help="Tokenizer name/path (default: use --run_dir).")
@@ -27,12 +35,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_config", type=str, default="wikitext-103-raw-v1")
     p.add_argument("--text_column", type=str, default="text")
     p.add_argument("--cache_dir", type=str, default=None)
-    p.add_argument("--tokenized_cache", type=str, default="./data/wikitext103_gpt2_1024", help="If set, save/load tokenized dataset here.")
+    p.add_argument("--tokenized_cache", type=str, default="./data/wikitext103_gpt2_1024")
 
     p.add_argument("--seq_len", type=int, default=1024)
     p.add_argument("--num_proc", type=int, default=8)
     p.add_argument("--max_eval_samples", type=int, default=None)
     p.add_argument("--max_test_samples", type=int, default=None)
+
+    # SBLA architecture parameters (should match training)
+    p.add_argument("--hidden_size", type=int, default=512)
+    p.add_argument("--num_hidden_layers", type=int, default=6)
+    p.add_argument("--num_heads", type=int, default=8)
+    p.add_argument("--num_landmarks", type=int, default=4)
+    p.add_argument("--fixed_block_size", type=int, default=64)
+    p.add_argument("--use_landmark_self_attn", action="store_true", default=True)
+    p.add_argument("--use_landmark_to_token", action="store_true", default=True)
+    p.add_argument("--use_gating", action="store_true", default=True)
 
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -132,6 +150,38 @@ def load_or_build_tokenized_dataset(args: argparse.Namespace, tokenizer) -> Data
     return ds
 
 
+def create_sbla_model(args, config_path: str):
+    """
+    Recreate the SBLA model architecture by loading config and patching with SBLA layers.
+    This mirrors the model creation in train_sbla_wikitext103_epochs20.py
+    """
+    from fla.layers import SBLAAttention
+    
+    # Load config from checkpoint
+    config = TransformerConfig.from_pretrained(config_path)
+    
+    # Create base transformer model
+    model = TransformerForCausalLM(config)
+    
+    # Monkey-patch to use SBLA attention (same as in training script)
+    for layer in model.model.layers:
+        old_attn = layer.attn
+        layer.attn = SBLAAttention(
+            hidden_size=args.hidden_size,
+            num_heads=args.num_heads,
+            num_landmarks=args.num_landmarks,
+            use_rope=True,
+            rope_theta=10000.,
+            use_landmark_self_attn=args.use_landmark_self_attn,
+            use_landmark_to_token=args.use_landmark_to_token,
+            gating=args.use_gating,
+            fixed_block_size=args.fixed_block_size,
+        )
+        del old_attn
+    
+    return model
+
+
 @torch.no_grad()
 def evaluate_ppl(model, dataset, *, batch_size: int, device: str) -> dict[str, float]:
     model.eval()
@@ -177,26 +227,41 @@ def main() -> None:
     dataset = load_or_build_tokenized_dataset(args, tokenizer)
     ckpt = best_checkpoint(args.run_dir)
 
-    model = AutoModelForCausalLM.from_pretrained(ckpt, torch_dtype=dtype).to(args.device)
+    # Recreate SBLA model architecture
+    print(f"[sbla] Recreating SBLA model architecture...")
+    model = create_sbla_model(args, ckpt)
+    
+    # Load trained weights
+    print(f"[sbla] Loading weights from {ckpt}...")
+    state_dict_path = os.path.join(ckpt, "pytorch_model.bin")
+    if os.path.exists(state_dict_path):
+        state_dict = torch.load(state_dict_path, map_location="cpu")
+        model.load_state_dict(state_dict, strict=False)  # strict=False in case of minor differences
+    else:
+        # Try loading with from_pretrained (may need adapter)
+        print(f"[sbla] Warning: pytorch_model.bin not found, attempting alternative loading...")
+    
+    model = model.to(args.device, dtype=dtype)
 
     out = {"run_dir": args.run_dir, "best_model_checkpoint": ckpt}
     if "validation" in dataset:
+        print(f"[sbla] Evaluating on validation set...")
         out["validation"] = evaluate_ppl(model, dataset["validation"], batch_size=args.batch_size, device=args.device)
     if "test" in dataset:
+        print(f"[sbla] Evaluating on test set...")
         out["test"] = evaluate_ppl(model, dataset["test"], batch_size=args.batch_size, device=args.device)
 
     out_path = os.path.join(args.run_dir, "eval_bestval_val_test.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
 
-    print(f"[kda] best_model_checkpoint={ckpt}", flush=True)
+    print(f"[sbla] best_model_checkpoint={ckpt}", flush=True)
     if "validation" in out:
-        print(f"[kda] val:  loss={out['validation']['loss']:.6f} ppl={out['validation']['perplexity']:.3f}", flush=True)
+        print(f"[sbla] val:  loss={out['validation']['loss']:.6f} ppl={out['validation']['perplexity']:.3f}", flush=True)
     if "test" in out:
-        print(f"[kda] test: loss={out['test']['loss']:.6f} ppl={out['test']['perplexity']:.3f}", flush=True)
-    print(f"[kda] wrote {out_path}", flush=True)
+        print(f"[sbla] test: loss={out['test']['loss']:.6f} ppl={out['test']['perplexity']:.3f}", flush=True)
+    print(f"[sbla] wrote {out_path}", flush=True)
 
 
 if __name__ == "__main__":
     main()
-

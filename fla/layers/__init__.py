@@ -17,6 +17,7 @@ from .hgrn2 import HGRN2Attention
 from .kda import KimiDeltaAttention
 from .mkda import MicrostepKimiDeltaAttention
 from .mkda_chunkwise import ChunkwiseMultiKeyDeltaAttention
+from .mskda import MultiScaleKimiDeltaAttention
 from .fkda import FastSlowKimiDeltaAttention
 from .fskda import FastSlowSurpriseKimiDeltaAttention
 from .fsnkda import FastSlowSurpriseNormalizedKimiDeltaAttention
@@ -39,6 +40,7 @@ from .rebased import ReBasedLinearAttention
 from .rodimus import RodimusAttention, SlidingWindowSharedKeyAttention
 from .rwkv6 import RWKV6Attention
 from .rwkv7 import RWKV7Attention
+from .sbla import SBLAAttention, SBLATransformerBlock
 
 __all__ = [
     'ABCAttention',
@@ -57,6 +59,7 @@ __all__ = [
     'KimiDeltaAttention',
     'MicrostepKimiDeltaAttention',
     'ChunkwiseMultiKeyDeltaAttention',
+    'MultiScaleKimiDeltaAttention',
     'FastSlowKimiDeltaAttention',
     'FastSlowSurpriseKimiDeltaAttention',
     'FastSlowSurpriseNormalizedKimiDeltaAttention',
@@ -79,6 +82,8 @@ __all__ = [
     'RodimusAttention',
     'RWKV6Attention',
     'RWKV7Attention',
+    'SBLAAttention',
+    'SBLATransformerBlock',
     'SlidingWindowSharedKeyAttention',
     'DeltaFormerAttention',
 ]

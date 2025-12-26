@@ -1,0 +1,33 @@
+# Flash Linear Attention - Requirements
+# Core dependencies
+
+# PyTorch (>= 2.5)
+torch>=2.5.0
+
+# Triton (>= 3.0 or nightly)
+triton>=3.0.0
+
+# Transformers (>= 4.45.0)
+transformers>=4.45.0
+
+# Einops for tensor operations
+einops
+
+# ----- Optional Dependencies -----
+
+# For datasets and benchmarking
+datasets>=3.3.0
+matplotlib
+
+# For testing
+pytest
+
+# For causal conv1d operations (optional, Triton implementations available)
+# causal-conv1d>=1.4.0
+
+# For development
+setuptools>=45
+wheel
+
+# Additional utilities
+numpy

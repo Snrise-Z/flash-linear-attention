@@ -1,4 +1,10 @@
 #!/usr/bin/env python
+"""
+Evaluate Multi-Scale KDA (MSKDA) on WikiText-103 using the run's best validation checkpoint.
+
+This script loads the best checkpoint from a training run (based on trainer_state.json)
+and evaluates on validation and test sets.
+"""
 from __future__ import annotations
 
 import argparse
@@ -18,7 +24,7 @@ import fla  # noqa: F401  (registers FLA models/configs with HF auto classes)
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Evaluate KDA on WikiText-103 using the run's best validation checkpoint (trainer_state.json)."
+        description="Evaluate Multi-Scale KDA (MSKDA) on WikiText-103 using the run's best validation checkpoint (trainer_state.json)."
     )
     p.add_argument("--run_dir", type=str, required=True, help="Training output dir (contains trainer_state.json).")
     p.add_argument("--tokenizer", type=str, default=None, help="Tokenizer name/path (default: use --run_dir).")
@@ -189,14 +195,13 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
 
-    print(f"[kda] best_model_checkpoint={ckpt}", flush=True)
+    print(f"[mskda] best_model_checkpoint={ckpt}", flush=True)
     if "validation" in out:
-        print(f"[kda] val:  loss={out['validation']['loss']:.6f} ppl={out['validation']['perplexity']:.3f}", flush=True)
+        print(f"[mskda] val:  loss={out['validation']['loss']:.6f} ppl={out['validation']['perplexity']:.3f}", flush=True)
     if "test" in out:
-        print(f"[kda] test: loss={out['test']['loss']:.6f} ppl={out['test']['perplexity']:.3f}", flush=True)
-    print(f"[kda] wrote {out_path}", flush=True)
+        print(f"[mskda] test: loss={out['test']['loss']:.6f} ppl={out['test']['perplexity']:.3f}", flush=True)
+    print(f"[mskda] wrote {out_path}", flush=True)
 
 
 if __name__ == "__main__":
     main()
-

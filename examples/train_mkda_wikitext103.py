@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         help="Micro-step readout mode: mix (default, learnable gamma over r) or last (use last micro-step only).",
     )
     p.add_argument("--beta_reg_lambda", type=float, default=0.0, help="Optional beta hinge regularization strength (default: 0).")
-    p.add_argument("--beta_reg_max", type=float, default=1.0, help="Beta hinge threshold (penalize beta > beta_reg_max).")
+    p.add_argument("--beta_reg_max", type=float, default=2.0, help="Beta hinge threshold (penalize beta > beta_reg_max).")
     p.add_argument("--orth_reg_lambda", type=float, default=0.0, help="Optional orthogonality regularization strength (default: 0).")
 
     p.add_argument("--use_short_conv", action="store_true", default=False)
@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--per_device_train_batch_size", type=int, default=1)
     p.add_argument("--per_device_eval_batch_size", type=int, default=1)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=2)
     p.add_argument("--learning_rate", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--warmup_steps", type=int, default=100)

@@ -1,4 +1,8 @@
 #!/usr/bin/env python
+"""
+Train SBLA on WikiText-103 for 20 epochs.
+Adapted from train_kda_wikitext103_epochs20.py with SBLA-specific modifications.
+"""
 from __future__ import annotations
 
 import argparse
@@ -10,33 +14,22 @@ from typing import Any
 
 import torch
 from datasets import DatasetDict, load_dataset, load_from_disk
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    DefaultDataCollator,
-    Trainer,
-    TrainingArguments,
-    TrainerCallback,
-)
+from transformers import AutoTokenizer, DefaultDataCollator, Trainer, TrainingArguments
 
-import fla  # noqa: F401  (registers FLA models/configs with HF auto classes)
-from fla.models import MKDAConfig
+from fla.models.transformer import TransformerConfig, TransformerForCausalLM
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description=(
-            "Train MKDA on WikiText-103 for a fixed budget (max_epochs=20), save best validation checkpoint, "
-            "then run test eval using the best-val checkpoint."
-        )
+        description="Train Transformer with SBLA on WikiText-103 for max_epochs=20"
     )
 
-    p.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer name or local path.")
-    p.add_argument("--dataset_name", type=str, default="wikitext", help="HF datasets name.")
-    p.add_argument("--dataset_config", type=str, default="wikitext-103-raw-v1", help="HF datasets config.")
+    p.add_argument("--tokenizer", type=str, default="gpt2")
+    p.add_argument("--dataset_name", type=str, default="wikitext")
+    p.add_argument("--dataset_config", type=str, default="wikitext-103-raw-v1")
     p.add_argument("--text_column", type=str, default="text")
-    p.add_argument("--cache_dir", type=str, default=None, help="HF datasets cache_dir.")
-    p.add_argument("--tokenized_cache", type=str, default="./data/wikitext103_gpt2_1024", help="If set, save/load tokenized dataset here.")
+    p.add_argument("--cache_dir", type=str, default=None)
+    p.add_argument("--tokenized_cache", type=str, default="./data/wikitext103_gpt2_1024")
 
     p.add_argument("--seq_len", type=int, default=1024)
     p.add_argument("--num_proc", type=int, default=8)
@@ -44,29 +37,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_eval_samples", type=int, default=None)
     p.add_argument("--max_test_samples", type=int, default=None)
 
-    p.add_argument("--output_dir", type=str, default="exp/mkda-wt103-e20-l6-microrank2-mix")
+    p.add_argument("--output_dir", type=str, default="exp/sbla-wt103-e20")
     p.add_argument("--resume_from_checkpoint", type=str, default=None)
 
-    # Architecture
+    # Architecture (matching KDA sizing for fair comparison)
     p.add_argument("--hidden_size", type=int, default=512)
     p.add_argument("--num_hidden_layers", type=int, default=6)
     p.add_argument("--num_heads", type=int, default=8)
-    p.add_argument("--head_dim", type=int, default=64)
-    p.add_argument("--expand_v", type=float, default=1.0)
-    p.add_argument("--attn_mode", type=str, default="chunk", choices=["chunk", "fused_recurrent"])
-    p.add_argument("--micro_rank", type=int, default=2)
-    p.add_argument("--micro_readout_mode", type=str, default="mix", choices=["mix", "last"])
-    p.add_argument("--beta_reg_lambda", type=float, default=0)
-    p.add_argument("--beta_reg_max", type=float, default=2)
-    p.add_argument("--orth_reg_lambda", type=float, default=0)
-
-    p.add_argument("--use_short_conv", action="store_true", default=False)
-    p.add_argument("--allow_neg_eigval", action="store_true", default=False)
+    p.add_argument("--num_landmarks", type=int, default=4, help="Number of landmarks per block for SBLA")
+    p.add_argument("--fixed_block_size", type=int, default=64, help="Fixed block size for SBLA")
+    p.add_argument("--use_landmark_self_attn", action="store_true", default=True)
+    p.add_argument("--use_landmark_to_token", action="store_true", default=True)
+    p.add_argument("--use_gating", action="store_true", default=True)
     p.add_argument("--no_fuse_norm", action="store_true", default=False)
     p.add_argument("--no_fuse_swiglu", action="store_true", default=False)
     p.add_argument("--no_fuse_cross_entropy", action="store_true", default=False)
 
-    # Training budget
+    # Training budget (same as KDA)
     p.add_argument("--max_epochs", type=int, default=20)
     p.add_argument("--per_device_train_batch_size", type=int, default=32)
     p.add_argument("--per_device_eval_batch_size", type=int, default=64)
@@ -81,12 +68,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bf16", action="store_true", default=True)
     p.add_argument("--dataloader_num_workers", type=int, default=4)
     p.add_argument("--preflight_compile", action="store_true", default=True)
-    p.add_argument(
-        "--print_microstep_stats",
-        action="store_true",
-        default=True,
-        help="Export micro-step stats to output_dir (and print a short summary), then continue.",
-    )
 
     return p.parse_args()
 
@@ -191,90 +172,6 @@ def load_or_build_tokenized_dataset(args: argparse.Namespace, tokenizer) -> Data
     return lm_ds
 
 
-def log_microstep_stats(
-    *,
-    model: torch.nn.Module,
-    input_ids: torch.Tensor,
-    output_dir: str,
-    micro_rank: int,
-    step: int,
-) -> str:
-    try:
-        device = next(model.parameters()).device
-    except StopIteration:
-        device = input_ids.device
-
-    input_ids = input_ids.to(device, non_blocking=True)
-    mkda_debug: list[dict[str, Any]] = []
-    was_training = model.training
-    model.eval()
-    with torch.inference_mode():
-        model(input_ids=input_ids, use_cache=False, mkda_debug=mkda_debug)
-    if was_training:
-        model.train()
-
-    mkda_debug = sorted(mkda_debug, key=lambda x: (x.get("layer_idx") is None, x.get("layer_idx", -1)))
-    stats_path = os.path.join(output_dir, f"mkda_microstep_stats_step{step:06d}.json")
-    payload = {
-        "kind": "mkda_microstep_stats",
-        "phase": "train",
-        "global_step": int(step),
-        "micro_rank": int(micro_rank),
-        "seq_len_sampled": int(input_ids.shape[1]),
-        "expanded_len_sampled": int(input_ids.shape[1]) * int(micro_rank),
-        "per_layer": mkda_debug,
-    }
-    with open(stats_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    return stats_path
-
-
-class MicrostepStatsCallback(TrainerCallback):
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        input_ids: torch.Tensor,
-        output_dir: str,
-        micro_rank: int,
-    ) -> None:
-        super().__init__()
-        self.enabled = bool(enabled)
-        self.input_ids = input_ids
-        self.output_dir = output_dir
-        self.micro_rank = int(micro_rank)
-        self.interesting_steps = {0, 100, 300, 1000}
-
-    def _maybe_log(self, *, model: torch.nn.Module, state) -> None:
-        if not self.enabled:
-            return
-        if not getattr(state, "is_world_process_zero", True):
-            return
-
-        step = int(getattr(state, "global_step", 0))
-        if step % 1000 != 0 and step not in self.interesting_steps:
-            return
-
-        stats_path = log_microstep_stats(
-            model=model,
-            input_ids=self.input_ids,
-            output_dir=self.output_dir,
-            micro_rank=self.micro_rank,
-            step=step,
-        )
-        print(f"[mkda] wrote {stats_path}", flush=True)
-
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if model is not None:
-            self._maybe_log(model=model, state=state)
-        return control
-
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if model is not None:
-            self._maybe_log(model=model, state=state)
-        return control
-
-
 @torch.no_grad()
 def evaluate_split(model, dataset, *, batch_size: int, device: str) -> dict[str, float]:
     from torch.utils.data import DataLoader
@@ -295,6 +192,50 @@ def evaluate_split(model, dataset, *, batch_size: int, device: str) -> dict[str,
     return {"loss": avg_loss, "perplexity": math.exp(avg_loss)}
 
 
+def create_sbla_model(args, vocab_size, pad_token_id, bos_token_id, eos_token_id):
+    """
+    Create a Transformer model with SBLA attention.
+    Note: This requires manually patching the model to use SBLA layers.
+    For a production implementation, you would create a dedicated SBLAConfig and SBLAForCausalLM.
+    """
+    config = TransformerConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        num_heads=args.num_heads,
+        max_position_embeddings=args.seq_len,
+        vocab_size=vocab_size,
+        pad_token_id=pad_token_id,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        fuse_norm=not args.no_fuse_norm,
+        fuse_swiglu=not args.no_fuse_swiglu,
+        fuse_cross_entropy=not args.no_fuse_cross_entropy,
+    )
+    
+    # Create transformer model
+    model = TransformerForCausalLM(config)
+    
+    # Monkey-patch to use SBLA attention
+    from fla.layers import SBLAAttention
+    for layer in model.model.layers:
+        # Replace the attention layer
+        old_attn = layer.attn
+        layer.attn = SBLAAttention(
+            hidden_size=args.hidden_size,
+            num_heads=args.num_heads,
+            num_landmarks=args.num_landmarks,
+            use_rope=True,
+            rope_theta=10000.,
+            use_landmark_self_attn=args.use_landmark_self_attn,
+            use_landmark_to_token=args.use_landmark_to_token,
+            gating=args.use_gating,
+            fixed_block_size=args.fixed_block_size,
+        )
+        del old_attn
+    
+    return model
+
+
 def main() -> None:
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -311,89 +252,19 @@ def main() -> None:
     fp16, bf16 = _detect_mixed_precision(args)
     dataset = load_or_build_tokenized_dataset(args, tokenizer)
 
-    config = MKDAConfig(
-        attn_mode=args.attn_mode,
-        hidden_size=args.hidden_size,
-        expand_v=args.expand_v,
-        use_short_conv=args.use_short_conv,
-        allow_neg_eigval=args.allow_neg_eigval,
-        head_dim=args.head_dim,
-        num_heads=args.num_heads,
-        micro_rank=args.micro_rank,
-        micro_readout_mode=args.micro_readout_mode,
-        beta_reg_lambda=args.beta_reg_lambda,
-        beta_reg_max=args.beta_reg_max,
-        orth_reg_lambda=args.orth_reg_lambda,
-        max_position_embeddings=args.seq_len,
-        num_hidden_layers=args.num_hidden_layers,
+    model = create_sbla_model(
+        args,
         vocab_size=tokenizer.vocab_size,
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        fuse_norm=not args.no_fuse_norm,
-        fuse_swiglu=not args.no_fuse_swiglu,
-        fuse_cross_entropy=not args.no_fuse_cross_entropy,
     )
-
-    model = AutoModelForCausalLM.from_config(config)
-
-    # Prepare a fixed sample for micro-step diagnostics
-    sample_device = "cuda" if torch.cuda.is_available() else "cpu"
-    example = dataset["train"][0]
-    sample_ids = torch.tensor(example["input_ids"][: min(args.seq_len, 256)], device=sample_device).unsqueeze(0)
-
-    if args.print_microstep_stats:
-        attn0 = model.model.layers[0].attn
-        print("[mkda] exporting micro-step stats...", flush=True)
-        print(f"[mkda] micro_rank={config.micro_rank}", flush=True)
-        print(f"[mkda] micro_readout_mode={getattr(config, 'micro_readout_mode', None)}", flush=True)
-        print(
-            f"[mkda] regs: beta_reg_lambda={getattr(config,'beta_reg_lambda',None)} "
-            f"beta_reg_max={getattr(config,'beta_reg_max',None)} "
-            f"orth_reg_lambda={getattr(config,'orth_reg_lambda',None)}",
-            flush=True,
-        )
-        print(f"[mkda] seq_len={args.seq_len} expanded_len(T*r)={args.seq_len * int(config.micro_rank)}", flush=True)
-
-        device = sample_device
-        mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
-        model_for_stats = model.to(device, dtype=mp_dtype).eval()
-
-        mkda_debug: list[dict[str, Any]] = []
-        with torch.no_grad():
-            model_for_stats(input_ids=sample_ids, use_cache=False, mkda_debug=mkda_debug)
-
-        mkda_debug = sorted(mkda_debug, key=lambda x: (x.get("layer_idx") is None, x.get("layer_idx", -1)))
-
-        stats_path = os.path.join(args.output_dir, "mkda_microstep_stats_preflight.json")
-        payload = {
-            "kind": "mkda_microstep_stats",
-            "phase": "preflight",
-            "micro_rank": int(config.micro_rank),
-            "seq_len_sampled": int(sample_ids.shape[1]),
-            "expanded_len_sampled": int(sample_ids.shape[1]) * int(config.micro_rank),
-            "per_layer": mkda_debug,
-        }
-        with open(stats_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-
-        k_cos = [d.get("k_cos_offdiag_abs_mean") for d in mkda_debug if d.get("k_cos_offdiag_abs_mean") is not None]
-        beta_rms = [d.get("beta_rms") for d in mkda_debug if d.get("beta_rms") is not None]
-        k_cos_mean = float(sum(k_cos) / max(len(k_cos), 1))
-        beta_rms_mean = float(sum(beta_rms) / max(len(beta_rms), 1))
-        print(
-            f"[mkda] wrote {stats_path} (layers={len(mkda_debug)}, "
-            f"mean k_offdiag_cos_abs={k_cos_mean:.4g}, mean beta_rms={beta_rms_mean:.4g})",
-            flush=True,
-        )
-        model = model_for_stats.to("cpu", dtype=torch.float32)
-        sample_ids = sample_ids.to("cpu")
 
     if args.preflight_compile and torch.cuda.is_available():
         mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
         tmp = model.to("cuda", dtype=mp_dtype).train()
         t = min(args.seq_len, 128)
-        input_ids = torch.randint(0, config.vocab_size, (1, t), device="cuda")
+        input_ids = torch.randint(0, tokenizer.vocab_size, (1, t), device="cuda")
         out = tmp(input_ids=input_ids, labels=input_ids, use_cache=False)
         out.loss.backward()
         torch.cuda.synchronize()
@@ -442,14 +313,6 @@ def main() -> None:
         data_collator=DefaultDataCollator(),
         processing_class=tokenizer,
     )
-    trainer.add_callback(
-        MicrostepStatsCallback(
-            enabled=args.print_microstep_stats,
-            input_ids=sample_ids,
-            output_dir=args.output_dir,
-            micro_rank=int(config.micro_rank),
-        )
-    )
 
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model()
@@ -475,13 +338,15 @@ def main() -> None:
     if "test" in dataset:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         mp_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
-        best_model = AutoModelForCausalLM.from_pretrained(best_ckpt or args.output_dir, torch_dtype=mp_dtype).to(device)
-        test_metrics = evaluate_split(best_model, dataset["test"], batch_size=args.per_device_eval_batch_size, device=device)
+        # Note: Loading requires the same patching
+        best_model = torch.load(os.path.join(best_ckpt or args.output_dir, "pytorch_model.bin"), map_location="cpu")
+        model.load_state_dict(best_model)
+        model = model.to(device, dtype=mp_dtype)
+        test_metrics = evaluate_split(model, dataset["test"], batch_size=args.per_device_eval_batch_size, device=device)
         with open(os.path.join(args.output_dir, "test_bestval.json"), "w", encoding="utf-8") as f:
             json.dump({"best_model_checkpoint": best_ckpt, "test": test_metrics}, f, ensure_ascii=False, indent=2)
-        print(f"[mkda] test(best-val): loss={test_metrics['loss']:.6f} ppl={test_metrics['perplexity']:.3f}", flush=True)
+        print(f"[sbla] test(best-val): loss={test_metrics['loss']:.6f} ppl={test_metrics['perplexity']:.3f}", flush=True)
 
 
 if __name__ == "__main__":
     main()
-
