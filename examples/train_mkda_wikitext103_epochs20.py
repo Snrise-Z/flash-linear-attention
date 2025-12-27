@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--attn_mode", type=str, default="chunk", choices=["chunk", "fused_recurrent"])
     p.add_argument("--micro_rank", type=int, default=2)
     p.add_argument("--micro_readout_mode", type=str, default="mix", choices=["mix", "last"])
+    p.add_argument("--rank_mix", type=str, default="none", choices=["none", "kv"], help="Optional rank-mix projection (default: none).")
     p.add_argument("--beta_reg_lambda", type=float, default=0)
     p.add_argument("--beta_reg_max", type=float, default=2)
     p.add_argument("--orth_reg_lambda", type=float, default=0)
@@ -321,6 +322,7 @@ def main() -> None:
         num_heads=args.num_heads,
         micro_rank=args.micro_rank,
         micro_readout_mode=args.micro_readout_mode,
+        rank_mix=args.rank_mix,
         beta_reg_lambda=args.beta_reg_lambda,
         beta_reg_max=args.beta_reg_max,
         orth_reg_lambda=args.orth_reg_lambda,
@@ -484,4 +486,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

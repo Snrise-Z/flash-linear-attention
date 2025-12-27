@@ -41,6 +41,7 @@ class ChunkwiseMultiKeyDeltaAttention(nn.Module):
         num_v_heads: int | None = None,
         num_keys: int = 4,
         chunk_size: int = 64,
+        rank_mix: str = "none",
         use_short_conv: bool = True,
         allow_neg_eigval: bool = False,
         conv_size: int = 4,
@@ -58,6 +59,7 @@ class ChunkwiseMultiKeyDeltaAttention(nn.Module):
 
         self.num_keys = int(num_keys)
         self.chunk_size = int(chunk_size)
+        self.rank_mix = str(rank_mix)
         self.allow_neg_eigval = allow_neg_eigval
         self.hidden_size = hidden_size
         self.expand_v = expand_v
@@ -92,6 +94,14 @@ class ChunkwiseMultiKeyDeltaAttention(nn.Module):
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim * self.num_keys, bias=False)
         self.v_proj = nn.Linear(hidden_size, self.value_dim * self.num_keys, bias=False)
+
+        if self.rank_mix not in ("none", "kv"):
+            raise ValueError(f"rank_mix must be one of {{'none','kv'}}, got {self.rank_mix!r}.")
+        if self.rank_mix == "kv" and self.num_keys > 1:
+            self.rank_mix_k = nn.Linear(self.num_keys, self.num_keys, bias=False)
+            self.rank_mix_v = nn.Linear(self.num_keys, self.num_keys, bias=False)
+            nn.init.eye_(self.rank_mix_k.weight)
+            nn.init.eye_(self.rank_mix_v.weight)
 
         if use_short_conv:
             self.q_conv1d = ShortConvolution(
@@ -223,6 +233,10 @@ class ChunkwiseMultiKeyDeltaAttention(nn.Module):
 
         if self.allow_neg_eigval:
             beta = beta * 2.0
+
+        if self.rank_mix == "kv" and self.num_keys > 1:
+            k = self.rank_mix_k(k.transpose(-1, -2)).transpose(-1, -2)
+            v = self.rank_mix_v(v.transpose(-1, -2)).transpose(-1, -2)
 
         # Match KDA's "use_qk_l2norm_in_kernel=True" behavior explicitly.
         q = F.normalize(q, p=2, dim=-1)

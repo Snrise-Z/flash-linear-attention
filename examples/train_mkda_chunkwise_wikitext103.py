@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--expand_v", type=float, default=1.0)
     p.add_argument("--micro_rank", type=int, default=4, help="Number of keys per token (R).")
     p.add_argument("--chunk_size", type=int, default=64)
+    p.add_argument("--rank_mix", type=str, default="none", choices=["none", "kv"], help="Optional rank-mix projection (default: none).")
 
     p.add_argument("--use_short_conv", action="store_true", default=False)
     p.add_argument("--allow_neg_eigval", action="store_true", default=False)
@@ -183,6 +184,7 @@ def main() -> None:
         head_dim=args.head_dim,
         num_heads=args.num_heads,
         micro_rank=args.micro_rank,
+        rank_mix=args.rank_mix,
         max_position_embeddings=args.seq_len,
         num_hidden_layers=args.num_hidden_layers,
         vocab_size=tokenizer.vocab_size,
@@ -248,4 +250,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

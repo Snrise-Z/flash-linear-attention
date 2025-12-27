@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
         choices=["mix", "last"],
         help="Micro-step readout mode: mix (default, learnable gamma over r) or last (use last micro-step only).",
     )
+    p.add_argument("--rank_mix", type=str, default="none", choices=["none", "kv"], help="Optional rank-mix projection (default: none).")
     p.add_argument("--beta_reg_lambda", type=float, default=0.0, help="Optional beta hinge regularization strength (default: 0).")
     p.add_argument("--beta_reg_max", type=float, default=2.0, help="Beta hinge threshold (penalize beta > beta_reg_max).")
     p.add_argument("--orth_reg_lambda", type=float, default=0.0, help="Optional orthogonality regularization strength (default: 0).")
@@ -313,6 +314,7 @@ def main() -> None:
         micro_rank=args.micro_rank,
         micro_fill_g_raw=args.micro_fill_g_raw,
         micro_readout_mode=args.micro_readout_mode,
+        rank_mix=args.rank_mix,
         beta_reg_lambda=args.beta_reg_lambda,
         beta_reg_max=args.beta_reg_max,
         orth_reg_lambda=args.orth_reg_lambda,

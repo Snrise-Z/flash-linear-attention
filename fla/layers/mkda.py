@@ -40,6 +40,7 @@ class MicrostepKimiDeltaAttention(nn.Module):
         micro_rank: int = 4,
         micro_fill_g_raw: float = -1.0e4,
         micro_readout_mode: str = "mix",
+        rank_mix: str = "none",
         use_short_conv: bool = True,
         allow_neg_eigval: bool = False,
         conv_size: int = 4,
@@ -57,6 +58,7 @@ class MicrostepKimiDeltaAttention(nn.Module):
         self.micro_rank = micro_rank
         self.micro_fill_g_raw = float(micro_fill_g_raw)
         self.micro_readout_mode = str(micro_readout_mode)
+        self.rank_mix = str(rank_mix)
         self.allow_neg_eigval = allow_neg_eigval
         self.hidden_size = hidden_size
         self.expand_v = expand_v
@@ -93,6 +95,14 @@ class MicrostepKimiDeltaAttention(nn.Module):
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim * micro_rank, bias=False)
         self.v_proj = nn.Linear(hidden_size, self.value_dim * micro_rank, bias=False)
+
+        if self.rank_mix not in ("none", "kv"):
+            raise ValueError(f"rank_mix must be one of {{'none','kv'}}, got {self.rank_mix!r}.")
+        if self.rank_mix == "kv" and int(micro_rank) > 1:
+            self.rank_mix_k = nn.Linear(int(micro_rank), int(micro_rank), bias=False)
+            self.rank_mix_v = nn.Linear(int(micro_rank), int(micro_rank), bias=False)
+            nn.init.eye_(self.rank_mix_k.weight)
+            nn.init.eye_(self.rank_mix_v.weight)
 
         if use_short_conv:
             self.q_conv1d = ShortConvolution(
@@ -230,6 +240,10 @@ class MicrostepKimiDeltaAttention(nn.Module):
 
         if self.allow_neg_eigval:
             beta = beta * 2.0
+
+        if self.rank_mix == "kv" and self.micro_rank > 1:
+            k = self.rank_mix_k(k.transpose(-1, -2)).transpose(-1, -2)
+            v = self.rank_mix_v(v.transpose(-1, -2)).transpose(-1, -2)
 
         if isinstance(mkda_reg, dict):
             beta_reg_lambda = float(mkda_reg.get("beta_reg_lambda", 0.0))
